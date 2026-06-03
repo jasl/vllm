@@ -945,7 +945,7 @@ def test_running_very_long_prefill_ignores_deferred_long_waiting_pressure():
     assert second_long_req.request_id not in mixed_output.num_scheduled_tokens
 
 
-def test_running_long_prefill_leaves_budget_for_later_running_decode():
+def test_running_very_long_prefill_defers_to_later_running_decode():
     scheduler = create_scheduler(
         max_num_batched_tokens=100,
         max_model_len=2048,
@@ -1009,8 +1009,8 @@ def test_running_long_prefill_leaves_budget_for_later_running_decode():
     assert short_req.num_computed_tokens >= short_req.num_prompt_tokens
 
     decode_mixed = scheduler.schedule()
-    assert decode_mixed.num_scheduled_tokens[long_prefill_req.request_id] == 6
     assert decode_mixed.num_scheduled_tokens[short_req.request_id] == 1
+    assert long_prefill_req.request_id not in decode_mixed.num_scheduled_tokens
 
 
 def test_mixed_decode_prefill_caps_mid_long_prefill_more_tightly():
@@ -1023,7 +1023,7 @@ def test_mixed_decode_prefill_caps_mid_long_prefill_more_tightly():
     decode_req = create_requests(num_requests=1, num_tokens=100, req_ids=["decode"])[0]
     mid_long_prefill_req = create_requests(
         num_requests=1,
-        num_tokens=500,
+        num_tokens=300,
         req_ids=["mid_long_prefill"],
     )[0]
 
@@ -1047,10 +1047,10 @@ def test_mixed_decode_prefill_caps_mid_long_prefill_more_tightly():
     mixed_output = scheduler.schedule()
 
     assert mixed_output.num_scheduled_tokens[decode_req.request_id] == 1
-    assert mixed_output.num_scheduled_tokens[mid_long_prefill_req.request_id] == 6
+    assert mixed_output.num_scheduled_tokens[mid_long_prefill_req.request_id] == 25
 
 
-def test_mixed_decode_prefill_caps_very_long_prefill_more_tightly():
+def test_mixed_decode_prefill_defers_very_long_prefill():
     scheduler = create_scheduler(
         max_num_batched_tokens=100,
         max_model_len=4096,
@@ -1084,7 +1084,7 @@ def test_mixed_decode_prefill_caps_very_long_prefill_more_tightly():
     mixed_output = scheduler.schedule()
 
     assert mixed_output.num_scheduled_tokens[decode_req.request_id] == 1
-    assert mixed_output.num_scheduled_tokens[very_long_prefill_req.request_id] == 6
+    assert very_long_prefill_req.request_id not in mixed_output.num_scheduled_tokens
 
 
 def test_preempt_during_execution():
