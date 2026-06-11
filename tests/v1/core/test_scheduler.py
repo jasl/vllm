@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -1256,6 +1257,85 @@ def test_mixed_decode_prefill_defers_very_long_prefill():
 
     assert mixed_output.num_scheduled_tokens[decode_req.request_id] == 1
     assert very_long_prefill_req.request_id not in mixed_output.num_scheduled_tokens
+
+
+def test_scheduler_trace_records_per_step_scheduling_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    trace_path = tmp_path / "scheduler_trace.jsonl"
+    monkeypatch.setenv("VLLM_SCHEDULER_TRACE_PATH", str(trace_path))
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        max_model_len=512,
+        max_num_seqs=2,
+        enable_chunked_prefill=True,
+    )
+    decode_req = create_requests(num_requests=1, num_tokens=100, req_ids=["decode"])[0]
+    long_prefill_req = create_requests(
+        num_requests=1,
+        num_tokens=300,
+        req_ids=["long_prefill"],
+    )[0]
+
+    scheduler.add_request(decode_req)
+    prefill_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[decode_req.request_id],
+            req_id_to_index={decode_req.request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.add_request(long_prefill_req)
+    scheduler.schedule()
+
+    trace_events = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(trace_events) == 2
+    assert trace_events[0]["step"] == 0
+    assert trace_events[1]["step"] == 1
+    assert trace_events[1]["token_budget_before_schedule"] == 100
+    assert trace_events[1]["waiting_request_count"] == 1
+    assert trace_events[1]["scheduled_requests"] == [
+        {
+            "request_id": "decode",
+            "phase": "decode",
+            "scheduled_tokens": 1,
+            "num_prompt_tokens": 100,
+            "num_computed_tokens_before": 100,
+            "num_tokens_with_spec": 101,
+            "num_output_placeholders": 0,
+            "remaining_prefill_tokens_before": 0,
+            "crosses_prefill_boundary": False,
+        },
+        {
+            "request_id": "long_prefill",
+            "phase": "prefill",
+            "scheduled_tokens": 25,
+            "num_prompt_tokens": 300,
+            "num_computed_tokens_before": 0,
+            "num_tokens_with_spec": 300,
+            "num_output_placeholders": 0,
+            "remaining_prefill_tokens_before": 300,
+            "crosses_prefill_boundary": False,
+        },
+    ]
+    assert trace_events[1]["running_requests_before_schedule"] == [
+        {
+            "request_id": "decode",
+            "phase": "decode",
+            "num_prompt_tokens": 100,
+            "num_computed_tokens_before": 100,
+            "remaining_prefill_tokens_before": 0,
+        }
+    ]
 
 
 def test_preempt_during_execution():
