@@ -59,6 +59,15 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+def _mtp_projection_prefix(quant_config, prefix: str, proj_name: str) -> str:
+    # compressed-tensors needs the layer name to match target/ignore rules.
+    # DeepSeek-V4-Flash's native fp8 MTP path keeps the legacy empty prefix;
+    # adding fp8 layer names here regresses MTP=2 default-sampling quality.
+    if quant_config is not None and quant_config.get_name() == "compressed-tensors":
+        return f"{prefix}.{proj_name}"
+    return ""
+
+
 class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
     def __init__(
         self,
@@ -86,7 +95,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             bias=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.e_proj",
+            prefix=_mtp_projection_prefix(quant_config, prefix, "e_proj"),
         )
         self.h_proj = ReplicatedLinear(
             config.hidden_size,
@@ -94,7 +103,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             bias=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.h_proj",
+            prefix=_mtp_projection_prefix(quant_config, prefix, "h_proj"),
         )
 
         self.hc_eps = config.hc_eps
