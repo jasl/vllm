@@ -35,3 +35,34 @@ def test_deepseek_v4_mtp_uniform_decode_warmup_still_respects_limits():
         max_tokens=96,
         max_reqs=256,
     ) == (1, 2, 4, 8, 16, 24, 32)
+
+
+def test_kernel_warmup_runs_with_sparse_mla_stats_path(monkeypatch):
+    calls = []
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(enable_flashinfer_autotune=False)
+        ),
+        model_runner=SimpleNamespace(is_pooling_model=True, attn_groups=[]),
+    )
+
+    monkeypatch.setattr(kernel_warmup.envs, "VLLM_USE_DEEP_GEMM", False)
+    monkeypatch.setattr(
+        kernel_warmup.envs,
+        "VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH",
+        "/tmp/sparse-mla-stats",
+    )
+    monkeypatch.setattr(
+        kernel_warmup,
+        "_deepseek_v4_sparse_mla_attention_warmup",
+        lambda _: calls.append("sparse_mla"),
+    )
+    monkeypatch.setattr(
+        kernel_warmup,
+        "_deepseek_v4_request_prep_warmup",
+        lambda _: calls.append("request_prep"),
+    )
+
+    kernel_warmup.kernel_warmup(worker)
+
+    assert calls == ["sparse_mla", "request_prep"]
