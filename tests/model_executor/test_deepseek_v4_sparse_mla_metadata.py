@@ -155,3 +155,18 @@ def test_prefill_has_cached_prefix_detects_extend_rows() -> None:
         num_decodes=1,
         num_prefills=2,
     )
+
+
+def test_prefill_has_cached_prefix_accepts_prefill_only_seq_lens() -> None:
+    assert not flashmla._prefill_has_cached_prefix(
+        seq_lens_cpu=torch.tensor([4, 4, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2, 6, 10, 14], dtype=torch.int32),
+        num_decodes=1,
+        num_prefills=3,
+    )
+    assert flashmla._prefill_has_cached_prefix(
+        seq_lens_cpu=torch.tensor([4, 9, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2, 6, 10, 14], dtype=torch.int32),
+        num_decodes=1,
+        num_prefills=3,
+    )

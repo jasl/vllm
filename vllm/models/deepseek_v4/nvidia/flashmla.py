@@ -516,7 +516,17 @@ def _prefill_has_cached_prefix(
         query_start_loc_cpu[prefill_start + 1 : prefill_end + 1]
         - query_start_loc_cpu[prefill_start:prefill_end]
     )
-    prefix_lens_cpu = seq_lens_cpu[prefill_start:prefill_end] - query_lens_cpu
+    if query_lens_cpu.numel() != num_prefills:
+        return True
+    if seq_lens_cpu.numel() >= prefill_end:
+        prefill_seq_lens_cpu = seq_lens_cpu[prefill_start:prefill_end]
+    elif seq_lens_cpu.numel() == num_prefills:
+        prefill_seq_lens_cpu = seq_lens_cpu
+    else:
+        return True
+    if prefill_seq_lens_cpu.numel() != query_lens_cpu.numel():
+        return True
+    prefix_lens_cpu = prefill_seq_lens_cpu - query_lens_cpu
     return bool(torch.any(prefix_lens_cpu > 0).item())
 
 
