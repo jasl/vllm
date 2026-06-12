@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import math
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -55,9 +60,390 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
+_sparse_mla_prefill_stats_disable_depth = 0
 _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS = 8192
 _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK = 256
 _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK = 1152
+
+
+@contextmanager
+def _disable_sparse_mla_prefill_stats() -> Iterator[None]:
+    global _sparse_mla_prefill_stats_disable_depth
+    _sparse_mla_prefill_stats_disable_depth += 1
+    try:
+        yield
+    finally:
+        _sparse_mla_prefill_stats_disable_depth -= 1
+
+
+def _sparse_mla_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _sparse_mla_cuda_device() -> int | None:
+    if torch.cuda.is_available():
+        return torch.cuda.current_device()
+    return None
+
+
+def _sparse_mla_prefill_stats_path() -> Path | None:
+    raw_path = envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if path.suffix:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    path.mkdir(parents=True, exist_ok=True)
+    return path / f"rank{_sparse_mla_rank()}.jsonl"
+
+
+def _sparse_mla_prefill_stats_enabled() -> bool:
+    return (
+        _sparse_mla_prefill_stats_disable_depth <= 0
+        and bool(envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH)
+    )
+
+
+def _sparse_mla_prefill_stage_timing_enabled() -> bool:
+    return (
+        _sparse_mla_prefill_stats_enabled()
+        and envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_STAGE_TIMING
+    )
+
+
+class _SparseMLAPrefillStageTimer:
+    def __init__(self) -> None:
+        self.enabled = (
+            _sparse_mla_prefill_stage_timing_enabled()
+            and torch.cuda.is_available()
+        )
+        self._events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
+    @contextmanager
+    def stage(self, name: str) -> Iterator[None]:
+        if not self.enabled:
+            yield
+            return
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        finally:
+            end.record()
+            self._events.append((name, start, end))
+
+    def elapsed_ms(self) -> dict[str, float]:
+        totals: dict[str, float] = {}
+        for name, start, end in self._events:
+            end.synchronize()
+            totals[name] = totals.get(name, 0.0) + float(start.elapsed_time(end))
+        return totals
+
+
+def _sparse_mla_lens_summary(combined_lens: torch.Tensor) -> dict[str, int]:
+    lens = combined_lens.detach().reshape(-1).to(device="cpu", dtype=torch.int64)
+    count = int(lens.numel())
+    if count == 0:
+        return {
+            "count": 0,
+            "min": 0,
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "max": 0,
+            "sum": 0,
+        }
+    lens, _ = torch.sort(lens)
+
+    def percentile(q: float) -> int:
+        idx = min(count - 1, int(math.ceil(q * (count - 1))))
+        return int(lens[idx].item())
+
+    return {
+        "count": count,
+        "min": int(lens[0].item()),
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+        "max": int(lens[-1].item()),
+        "sum": int(lens.sum().item()),
+    }
+
+
+def _sparse_mla_candidate_overlap_groups(
+    per_row: list[list[int]],
+) -> dict[str, dict[str, float | int]]:
+    rows = len(per_row)
+    group_summaries: dict[str, dict[str, float | int]] = {}
+    for group_size in (2, 4, 8, 16, 32):
+        groups = 0
+        total_valid = 0
+        total_unique = 0
+        for start in range(0, rows, group_size):
+            group = per_row[start : start + group_size]
+            if len(group) < group_size:
+                break
+            flattened: list[int] = []
+            for values in group:
+                flattened.extend(values)
+            if not flattened:
+                continue
+            groups += 1
+            total_valid += len(flattened)
+            total_unique += len(set(flattened))
+        group_summaries[str(group_size)] = {
+            "groups": groups,
+            "valid_candidates": total_valid,
+            "unique_candidates": total_unique,
+            "unique_to_valid_ratio": (
+                float(total_unique) / float(total_valid) if total_valid else 0.0
+            ),
+        }
+    return group_summaries
+
+
+def _sparse_mla_candidate_rows(
+    combined_indices: torch.Tensor,
+    combined_lens: torch.Tensor,
+    sample_rows: int,
+) -> list[list[int]]:
+    rows = min(
+        int(sample_rows),
+        int(combined_lens.numel()),
+        int(combined_indices.shape[0]),
+    )
+    if rows <= 0:
+        return []
+    indices_cpu = combined_indices[:rows].detach().to(device="cpu", dtype=torch.int64)
+    lens_cpu = combined_lens[:rows].detach().to(device="cpu", dtype=torch.int64)
+    per_row: list[list[int]] = []
+    for row_idx in range(rows):
+        valid_len = max(0, min(int(lens_cpu[row_idx].item()), indices_cpu.shape[1]))
+        row_values = indices_cpu[row_idx, :valid_len]
+        per_row.append([int(x) for x in row_values.tolist() if int(x) >= 0])
+    return per_row
+
+
+def _sparse_mla_candidate_overlap_summary(
+    combined_indices: torch.Tensor,
+    combined_lens: torch.Tensor,
+    sample_rows: int,
+) -> dict[str, object]:
+    if sample_rows <= 0:
+        return {}
+    per_row = _sparse_mla_candidate_rows(
+        combined_indices=combined_indices,
+        combined_lens=combined_lens,
+        sample_rows=sample_rows,
+    )
+    return {
+        "sample_rows": len(per_row),
+        "groups": _sparse_mla_candidate_overlap_groups(per_row),
+    }
+
+
+def _sparse_mla_candidate_region_overlap_summary(
+    combined_indices: torch.Tensor,
+    combined_lens: torch.Tensor,
+    sample_rows: int,
+    gather_region_size: int,
+    swa_region_offset: int,
+) -> dict[str, object]:
+    if sample_rows <= 0 or gather_region_size <= 0:
+        return {}
+    per_row = _sparse_mla_candidate_rows(
+        combined_indices=combined_indices,
+        combined_lens=combined_lens,
+        sample_rows=sample_rows,
+    )
+    compressed_rows: list[list[int]] = []
+    swa_rows: list[list[int]] = []
+    for values in per_row:
+        compressed: list[int] = []
+        swa: list[int] = []
+        for value in values:
+            local = value % gather_region_size
+            if local < swa_region_offset:
+                compressed.append(value)
+            else:
+                swa.append(value)
+        compressed_rows.append(compressed)
+        swa_rows.append(swa)
+    return {
+        "sample_rows": len(per_row),
+        "compressed": _sparse_mla_candidate_overlap_groups(compressed_rows),
+        "swa": _sparse_mla_candidate_overlap_groups(swa_rows),
+    }
+
+
+def _sparse_mla_candidate_region_work_summary(
+    *,
+    query_tokens: int,
+    combined_topk: int,
+    compressed_region_width: int,
+    swa_region_width: int,
+    compressed_candidate_visits: int | None,
+    swa_candidate_visits: int | None,
+) -> dict[str, dict[str, float | int]]:
+    if query_tokens <= 0 or combined_topk <= 0:
+        return {}
+    if compressed_candidate_visits is None and swa_candidate_visits is None:
+        return {}
+
+    def summarize_region(slots: int, effective: int) -> dict[str, float | int]:
+        padding = max(0, slots - effective)
+        return {
+            "candidate_slots": slots,
+            "effective_candidate_visits": effective,
+            "padding_candidate_visits": padding,
+            "padding_ratio": float(padding) / float(slots) if slots else 0.0,
+        }
+
+    summary: dict[str, dict[str, float | int]] = {}
+    compressed_width = max(0, int(compressed_region_width))
+    swa_width = max(0, int(swa_region_width))
+    if compressed_width > 0 and compressed_candidate_visits is not None:
+        summary["compressed"] = summarize_region(
+            slots=int(query_tokens) * compressed_width,
+            effective=max(0, int(compressed_candidate_visits)),
+        )
+    if swa_width > 0 and swa_candidate_visits is not None:
+        summary["swa"] = summarize_region(
+            slots=int(query_tokens) * swa_width,
+            effective=max(0, int(swa_candidate_visits)),
+        )
+    alignment_width = max(
+        0,
+        int(combined_topk) - compressed_width - swa_width,
+    )
+    if alignment_width > 0:
+        summary["alignment_padding"] = summarize_region(
+            slots=int(query_tokens) * alignment_width,
+            effective=0,
+        )
+    return summary
+
+
+def _sparse_mla_prefill_candidate_region_visits(
+    *,
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    num_decodes: int,
+    chunk_start: int,
+    chunk_end: int,
+    top_k: int,
+    compress_ratio: int,
+    window_size: int,
+) -> tuple[int, int]:
+    compressed_visits = 0
+    swa_visits = 0
+    safe_compress_ratio = max(1, int(compress_ratio))
+    safe_top_k = max(0, int(top_k))
+    safe_window_size = max(0, int(window_size))
+    for req_idx in range(chunk_start, chunk_end):
+        query_start = int(query_start_loc_cpu[num_decodes + req_idx].item())
+        query_end = int(query_start_loc_cpu[num_decodes + req_idx + 1].item())
+        query_len = max(0, query_end - query_start)
+        seq_len = int(seq_lens_cpu[req_idx].item())
+        start_pos = seq_len - query_len
+        for token_offset in range(query_len):
+            pos = start_pos + token_offset
+            token_len = max(0, pos + 1)
+            compressed_visits += min(token_len // safe_compress_ratio, safe_top_k)
+            swa_visits += min(token_len, safe_window_size)
+    return compressed_visits, swa_visits
+
+
+def _write_sparse_mla_prefill_stats(
+    *,
+    layer_type: str,
+    layer_prefix: str,
+    compress_ratio: int,
+    num_prefills: int,
+    query_tokens: int,
+    combined_topk: int,
+    combined_lens: torch.Tensor,
+    combined_indices: torch.Tensor | None = None,
+    gather_region_size: int = 0,
+    swa_region_offset: int = 0,
+    compressed_region_width: int = 0,
+    swa_region_width: int = 0,
+    compressed_candidate_visits: int | None = None,
+    swa_candidate_visits: int | None = None,
+    stage_timings_ms: dict[str, float] | None = None,
+) -> None:
+    if not _sparse_mla_prefill_stats_enabled():
+        return
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    try:
+        path = _sparse_mla_prefill_stats_path()
+    except OSError:
+        return
+    if path is None:
+        return
+
+    try:
+        lens_summary = _sparse_mla_lens_summary(combined_lens)
+        candidate_slots = int(query_tokens) * int(combined_topk)
+        effective_visits = int(lens_summary["sum"])
+        padding_visits = max(0, candidate_slots - effective_visits)
+        row: dict[str, object] = {
+            "kind": "deepseek_v4_sparse_mla_prefill_stats",
+            "version": 1,
+            "rank": _sparse_mla_rank(),
+            "cuda_device": _sparse_mla_cuda_device(),
+            "layer_type": layer_type,
+            "layer_prefix": layer_prefix,
+            "compress_ratio": int(compress_ratio),
+            "num_prefills": int(num_prefills),
+            "query_tokens": int(query_tokens),
+            "combined_topk": int(combined_topk),
+            "candidate_slots": candidate_slots,
+            "effective_candidate_visits": effective_visits,
+            "padding_candidate_visits": padding_visits,
+            "combined_lens": lens_summary,
+        }
+        region_work = _sparse_mla_candidate_region_work_summary(
+            query_tokens=int(query_tokens),
+            combined_topk=int(combined_topk),
+            compressed_region_width=int(compressed_region_width),
+            swa_region_width=int(swa_region_width),
+            compressed_candidate_visits=compressed_candidate_visits,
+            swa_candidate_visits=swa_candidate_visits,
+        )
+        if region_work:
+            row["candidate_region_work"] = region_work
+        if stage_timings_ms:
+            row["stage_timings_ms"] = {
+                str(name): float(value)
+                for name, value in sorted(stage_timings_ms.items())
+            }
+        overlap_rows = envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_OVERLAP_ROWS
+        if combined_indices is not None and overlap_rows > 0:
+            row["candidate_overlap"] = _sparse_mla_candidate_overlap_summary(
+                combined_indices=combined_indices,
+                combined_lens=combined_lens,
+                sample_rows=overlap_rows,
+            )
+            row["candidate_region_overlap"] = (
+                _sparse_mla_candidate_region_overlap_summary(
+                    combined_indices=combined_indices,
+                    combined_lens=combined_lens,
+                    sample_rows=overlap_rows,
+                    gather_region_size=gather_region_size,
+                    swa_region_offset=swa_region_offset,
+                )
+            )
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=True) + "\n")
+    except Exception:
+        # Diagnostic stats must never affect inference.
+        return
 
 
 def _use_indexed_d512_split_prefill(
@@ -176,6 +562,22 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         if indexer_topk is not None:
             return int(indexer_topk)
         return 2048
+
+    @classmethod
+    def _prefill_stats_layer_type(
+        cls,
+        *,
+        triton_sparse_mla_enabled: bool,
+        indexed_d512_split_prefill: bool,
+        indexed_d512_chunked_prefill: bool = False,
+    ) -> str:
+        if not triton_sparse_mla_enabled:
+            return "mla_prefill_flashmla"
+        if indexed_d512_chunked_prefill:
+            return "mla_prefill_indexed_d512_chunked"
+        if indexed_d512_split_prefill:
+            return "mla_prefill_indexed_d512"
+        return "mla_prefill_chunk"
 
     @classmethod
     def _prefill_workspace_reservation_specs(
@@ -1021,6 +1423,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             )
             prefill_state_buffers = None
         for chunk_idx in range(num_chunks):
+            write_stats = _sparse_mla_prefill_stats_enabled()
+            stage_timer = (
+                _SparseMLAPrefillStageTimer()
+                if _sparse_mla_prefill_stage_timing_enabled()
+                else None
+            )
             chunk_start = chunk_idx * chunk_size_const
             chunk_end = min(chunk_start + chunk_size_const, num_prefills)
             chunk_size = chunk_end - chunk_start
@@ -1028,27 +1436,39 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
-                dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
-                    compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
-                )
+                with (
+                    stage_timer.stage("gather_compressed_kv")
+                    if stage_timer is not None
+                    else nullcontext()
+                ):
+                    dequantize_and_gather_k_cache(
+                        kv[:chunk_size],
+                        compressed_k_cache,
+                        seq_lens=(
+                            seq_lens[chunk_start:chunk_end] // self.compress_ratio
+                        ),
+                        gather_lens=None,
+                        block_table=block_table[chunk_start:chunk_end],
+                        block_size=attn_metadata.block_size // self.compress_ratio,
+                        offset=0,
+                    )
 
             # Gather SWA KV
             swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
-                offset=N,
-            )
+            with (
+                stage_timer.stage("gather_swa_kv")
+                if stage_timer is not None
+                else nullcontext()
+            ):
+                dequantize_and_gather_k_cache(
+                    kv[:chunk_size],
+                    swa_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    block_table=swa_block_table[chunk_start:chunk_end],
+                    block_size=swa_metadata.block_size,
+                    offset=N,
+                )
 
             # Combine the topk indices and SWA indices for gathered KV cache
             query_start = (
@@ -1058,38 +1478,93 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = combine_topk_swa_indices(
-                topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
-                self.window_size,
-                self.compress_ratio,
-                top_k,
-                M,
-                N,
-                combined_indices=combined_indices_buffer,
-                combined_lens=combined_lens_buffer,
-            )
-            if triton_sparse_mla_enabled:
-                self._forward_sparse_mla_prefill_triton(
-                    self,
-                    q=q[query_start:query_end],
-                    kv=kv[:chunk_size],
-                    combined_indices=combined_indices,
-                    combined_lens=combined_lens,
-                    output=output[query_start:query_end],
-                    state_buffers=prefill_state_buffers,
+            with (
+                stage_timer.stage("combine_indices")
+                if stage_timer is not None
+                else nullcontext()
+            ):
+                combined_indices, combined_lens = combine_topk_swa_indices(
+                    topk_indices[query_start:query_end],
+                    query_start_loc[
+                        num_decodes + chunk_start : num_decodes + chunk_end + 1
+                    ],
+                    seq_lens[chunk_start:chunk_end],
+                    gather_lens[chunk_start:chunk_end],
+                    self.window_size,
+                    self.compress_ratio,
+                    top_k,
+                    M,
+                    N,
+                    combined_indices=combined_indices_buffer,
+                    combined_lens=combined_lens_buffer,
                 )
+            if triton_sparse_mla_enabled:
+                with (
+                    stage_timer.stage("sparse_accumulate")
+                    if stage_timer is not None
+                    else nullcontext()
+                ):
+                    self._forward_sparse_mla_prefill_triton(
+                        self,
+                        q=q[query_start:query_end],
+                        kv=kv[:chunk_size],
+                        combined_indices=combined_indices,
+                        combined_lens=combined_lens,
+                        output=output[query_start:query_end],
+                        state_buffers=prefill_state_buffers,
+                    )
             else:
-                flash_mla_sparse_fwd(
-                    q=q[query_start:query_end],
-                    kv=kv.view(-1, 1, q.shape[-1]),
-                    indices=combined_indices.unsqueeze(1),
-                    sm_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_length=combined_lens,
-                    out=output[query_start:query_end],
+                with (
+                    stage_timer.stage("sparse_accumulate")
+                    if stage_timer is not None
+                    else nullcontext()
+                ):
+                    flash_mla_sparse_fwd(
+                        q=q[query_start:query_end],
+                        kv=kv.view(-1, 1, q.shape[-1]),
+                        indices=combined_indices.unsqueeze(1),
+                        sm_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        topk_length=combined_lens,
+                        out=output[query_start:query_end],
+                    )
+            if write_stats:
+                compressed_visits, swa_visits = (
+                    _sparse_mla_prefill_candidate_region_visits(
+                        query_start_loc_cpu=query_start_loc_cpu,
+                        seq_lens_cpu=seq_lens_cpu,
+                        num_decodes=num_decodes,
+                        chunk_start=chunk_start,
+                        chunk_end=chunk_end,
+                        top_k=top_k,
+                        compress_ratio=self.compress_ratio,
+                        window_size=self.window_size,
+                    )
+                )
+                _write_sparse_mla_prefill_stats(
+                    layer_type=self._prefill_stats_layer_type(
+                        triton_sparse_mla_enabled=triton_sparse_mla_enabled,
+                        indexed_d512_split_prefill=indexed_d512_split_prefill,
+                        indexed_d512_chunked_prefill=(
+                            indexed_d512_chunked_prefill
+                        ),
+                    ),
+                    layer_prefix=self.prefix,
+                    compress_ratio=self.compress_ratio,
+                    num_prefills=chunk_size,
+                    query_tokens=int(query_end - query_start),
+                    combined_topk=combined_indices.shape[-1],
+                    combined_lens=combined_lens,
+                    combined_indices=combined_indices,
+                    gather_region_size=M,
+                    swa_region_offset=N,
+                    compressed_region_width=top_k,
+                    swa_region_width=self.window_size,
+                    compressed_candidate_visits=compressed_visits,
+                    swa_candidate_visits=swa_visits,
+                    stage_timings_ms=(
+                        stage_timer.elapsed_ms()
+                        if stage_timer is not None
+                        else None
+                    ),
                 )
