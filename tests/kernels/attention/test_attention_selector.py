@@ -14,6 +14,7 @@ from vllm.config import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.cpu import CpuPlatform
+from vllm.platforms.interface import DeviceCapability
 
 # CudaPlatform and RocmPlatform import their respective compiled C extensions
 # at module level, raising ModuleNotFoundError on incompatible builds.
@@ -28,7 +29,11 @@ except (ImportError, ModuleNotFoundError):
     RocmPlatform = None
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
+from vllm.v1.attention.selector import (
+    AttentionSelectorConfig,
+    _cached_get_attn_backend,
+    get_attn_backend,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -324,6 +329,31 @@ def test_invalid_backend():
     ):
         # Invalid backend name should raise ValueError when creating enum
         AttentionConfig(backend=AttentionBackendEnum["INVALID"])
+
+
+def test_glm_sparse_mla_can_force_flashmla_sparse_on_sm12x(monkeypatch):
+    if CudaPlatform is None:
+        pytest.skip("CudaPlatform not available")
+
+    monkeypatch.setattr(
+        CudaPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(12, 1)),
+    )
+
+    backend = CudaPlatform.get_attn_backend_cls(
+        selected_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+        attn_selector_config=AttentionSelectorConfig(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="bfloat16",
+            block_size=None,
+            use_mla=True,
+            use_sparse=True,
+        ),
+    )
+
+    assert backend == AttentionBackendEnum.FLASHMLA_SPARSE.get_path()
 
 
 @pytest.mark.parametrize("auto_value", ["auto", "AUTO", "Auto"])
