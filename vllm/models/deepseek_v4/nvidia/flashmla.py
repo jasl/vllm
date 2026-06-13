@@ -376,6 +376,7 @@ def _write_sparse_mla_prefill_stats(
     layer_prefix: str,
     compress_ratio: int,
     num_prefills: int,
+    max_prefill_seq_len: int | None = None,
     query_tokens: int,
     combined_topk: int,
     combined_lens: torch.Tensor,
@@ -421,6 +422,8 @@ def _write_sparse_mla_prefill_stats(
             "padding_candidate_visits": padding_visits,
             "combined_lens": lens_summary,
         }
+        if max_prefill_seq_len is not None:
+            row["max_prefill_seq_len"] = int(max_prefill_seq_len)
         region_work = _sparse_mla_candidate_region_work_summary(
             query_tokens=int(query_tokens),
             combined_topk=int(combined_topk),
@@ -1385,6 +1388,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 max_query_chunk_tokens, int(query_end - query_start)
             )
         combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
+        max_prefill_seq_len = int(seq_lens_cpu.max().item())
         has_cached_prefix = _prefill_has_cached_prefix(
             seq_lens_cpu=seq_lens_cpu,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -1413,7 +1417,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 head_dim=int(self.head_dim),
                 num_prefills=int(num_prefills),
                 combined_topk=int(combined_topk),
-                max_prefill_seq_len=int(seq_lens_cpu.max().item()),
+                max_prefill_seq_len=max_prefill_seq_len,
                 swa_only=swa_only,
             )
             if not indexed_d512_split_prefill:
@@ -1422,7 +1426,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     head_dim=int(self.head_dim),
                     num_prefills=int(num_prefills),
                     combined_topk=int(combined_topk),
-                    max_prefill_seq_len=int(seq_lens_cpu.max().item()),
+                    max_prefill_seq_len=max_prefill_seq_len,
                     swa_only=swa_only,
                 )
             extra_specs: list[tuple[tuple[int, ...], torch.dtype]] = []
@@ -1616,6 +1620,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     layer_prefix=self.prefix,
                     compress_ratio=self.compress_ratio,
                     num_prefills=chunk_size,
+                    max_prefill_seq_len=max_prefill_seq_len,
                     query_tokens=int(query_end - query_start),
                     combined_topk=combined_indices.shape[-1],
                     combined_lens=combined_lens,
