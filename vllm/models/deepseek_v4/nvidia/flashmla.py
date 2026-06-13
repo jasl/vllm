@@ -490,6 +490,12 @@ def _is_indexed_d512_split_topk(combined_topk: int) -> bool:
     )
 
 
+def _use_indexed_d512_fused_sink_prefill(*, split_prefill: bool) -> bool:
+    return split_prefill and bool(
+        getattr(envs, "VLLM_DEEPSEEK_V4_INDEXED_D512_FUSED_SINK_PREFILL", False)
+    )
+
+
 def _prefill_has_cached_prefix(
     *,
     seq_lens_cpu: torch.Tensor,

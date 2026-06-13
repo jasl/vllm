@@ -54,6 +54,15 @@ def test_indexed_d512_split_topk_keeps_small_c128a_prefills() -> None:
     assert not flashmla._is_indexed_d512_split_topk(1280)
 
 
+def test_indexed_d512_fused_sink_prefill_defaults_off() -> None:
+    assert not flashmla._use_indexed_d512_fused_sink_prefill(
+        split_prefill=False,
+    )
+    assert not flashmla._use_indexed_d512_fused_sink_prefill(
+        split_prefill=True,
+    )
+
+
 def test_prefill_has_cached_prefix_detects_extend_rows() -> None:
     assert not flashmla._prefill_has_cached_prefix(
         seq_lens_cpu=torch.tensor([6, 4], dtype=torch.int32),
