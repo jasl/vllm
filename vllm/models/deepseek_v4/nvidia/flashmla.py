@@ -481,7 +481,20 @@ def _use_indexed_d512_split_prefill(
         and head_dim == 512
         and num_prefills == 1
         and _is_indexed_d512_split_topk(combined_topk)
-        and max_prefill_seq_len >= _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
+        and max_prefill_seq_len >= _indexed_d512_split_prefill_min_tokens()
+    )
+
+
+def _indexed_d512_split_prefill_min_tokens() -> int:
+    return max(
+        0,
+        int(
+            getattr(
+                envs,
+                "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS",
+                _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS,
+            )
+        ),
     )
 
 
@@ -545,7 +558,7 @@ def _use_indexed_d512_chunked_prefill(
         and head_dim == 512
         and num_prefills == 1
         and combined_topk > _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
-        and max_prefill_seq_len >= _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
+        and max_prefill_seq_len >= _indexed_d512_split_prefill_min_tokens()
     )
 
 
@@ -1644,6 +1657,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                             _use_indexed_d512_fused_sink_prefill(
                                 split_prefill=indexed_d512_split_prefill,
                             )
+                        ),
+                        "indexed_d512_min_tokens": (
+                            _indexed_d512_split_prefill_min_tokens()
                         ),
                         "indexed_d512_split_prefill": indexed_d512_split_prefill,
                         "prefill_state_buffer_count": (
