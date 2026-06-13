@@ -108,7 +108,6 @@ def test_sparse_mla_prefill_stats_writer_emits_route_context(
         layer_prefix="model.layers.0.self_attn",
         compress_ratio=4,
         num_prefills=1,
-        max_prefill_seq_len=65536,
         query_tokens=2,
         combined_topk=640,
         combined_lens=torch.tensor([640, 512], dtype=torch.int32),
