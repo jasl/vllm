@@ -490,6 +490,35 @@ def _is_indexed_d512_split_topk(combined_topk: int) -> bool:
     )
 
 
+def _prefill_has_cached_prefix(
+    *,
+    seq_lens_cpu: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_decodes: int,
+    num_prefills: int,
+) -> bool:
+    if num_prefills <= 0:
+        return False
+    prefill_start = num_decodes
+    prefill_end = num_decodes + num_prefills
+    query_lens_cpu = (
+        query_start_loc_cpu[prefill_start + 1 : prefill_end + 1]
+        - query_start_loc_cpu[prefill_start:prefill_end]
+    )
+    if query_lens_cpu.numel() != num_prefills:
+        return True
+    if seq_lens_cpu.numel() >= prefill_end:
+        prefill_seq_lens_cpu = seq_lens_cpu[prefill_start:prefill_end]
+    elif seq_lens_cpu.numel() == num_prefills:
+        prefill_seq_lens_cpu = seq_lens_cpu
+    else:
+        return True
+    if prefill_seq_lens_cpu.numel() != query_lens_cpu.numel():
+        return True
+    prefix_lens_cpu = prefill_seq_lens_cpu - query_lens_cpu
+    return bool(torch.any(prefix_lens_cpu > 0).item())
+
+
 def _use_indexed_d512_chunked_prefill(
     *,
     compress_ratio: int,
@@ -1350,6 +1379,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 max_query_chunk_tokens, int(query_end - query_start)
             )
         combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
+        has_cached_prefix = _prefill_has_cached_prefix(
+            seq_lens_cpu=seq_lens_cpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            num_decodes=int(num_decodes),
+            num_prefills=int(num_prefills),
+        )
 
         workspace_manager = current_workspace_manager()
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
