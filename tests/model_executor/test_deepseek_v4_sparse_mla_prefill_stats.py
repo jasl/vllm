@@ -3,9 +3,12 @@
 
 import json
 
+import pytest
 import torch
 
 from vllm.models.deepseek_v4.nvidia import flashmla as flashmla_mod
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def _set_stats_env(monkeypatch, path: str) -> None:
@@ -95,3 +98,44 @@ def test_sparse_mla_prefill_stats_writer_emits_region_and_overlap(
     assert row["candidate_region_overlap"]["swa"]["2"][
         "unique_to_valid_ratio"
     ] == 2 / 3
+
+
+def test_sparse_mla_prefill_stats_writer_emits_route_context(
+    tmp_path, monkeypatch
+) -> None:
+    _set_stats_env(monkeypatch, str(tmp_path))
+
+    flashmla_mod._write_sparse_mla_prefill_stats(
+        layer_type="mla_prefill_indexed_d512",
+        layer_prefix="model.layers.0.self_attn",
+        compress_ratio=4,
+        num_prefills=1,
+        max_prefill_seq_len=65536,
+        query_tokens=2,
+        combined_topk=640,
+        combined_lens=torch.tensor([640, 512], dtype=torch.int32),
+        route_context={
+            "triton_sparse_mla_enabled": True,
+            "indexed_d512_split_prefill": True,
+            "indexed_d512_chunked_prefill": False,
+            "indexed_d512_fused_sink_prefill": True,
+            "has_cached_prefix": False,
+            "query_chunk_size": 2,
+            "prefill_state_buffer_count": 4,
+        },
+    )
+
+    rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(tmp_path.glob("*.jsonl"))
+    ]
+    assert len(rows) == 1
+    assert rows[0]["route_context"] == {
+        "has_cached_prefix": False,
+        "indexed_d512_chunked_prefill": False,
+        "indexed_d512_fused_sink_prefill": True,
+        "indexed_d512_split_prefill": True,
+        "prefill_state_buffer_count": 4,
+        "query_chunk_size": 2,
+        "triton_sparse_mla_enabled": True,
+    }

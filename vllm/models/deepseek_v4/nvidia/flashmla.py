@@ -3,7 +3,7 @@
 
 import json
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -329,6 +329,18 @@ def _sparse_mla_candidate_region_work_summary(
     return summary
 
 
+def _sparse_mla_json_scalar_metadata(
+    metadata: Mapping[str, object] | None,
+) -> dict[str, object]:
+    if not metadata:
+        return {}
+    safe_metadata: dict[str, object] = {}
+    for key, value in sorted(metadata.items()):
+        if value is None or isinstance(value, bool | int | float | str):
+            safe_metadata[str(key)] = value
+    return safe_metadata
+
+
 def _sparse_mla_prefill_candidate_region_visits(
     *,
     query_start_loc_cpu: torch.Tensor,
@@ -377,6 +389,7 @@ def _write_sparse_mla_prefill_stats(
     compressed_candidate_visits: int | None = None,
     swa_candidate_visits: int | None = None,
     stage_timings_ms: dict[str, float] | None = None,
+    route_context: Mapping[str, object] | None = None,
 ) -> None:
     if not _sparse_mla_prefill_stats_enabled():
         return
@@ -427,6 +440,9 @@ def _write_sparse_mla_prefill_stats(
                 str(name): float(value)
                 for name, value in sorted(stage_timings_ms.items())
             }
+        route_context_summary = _sparse_mla_json_scalar_metadata(route_context)
+        if route_context_summary:
+            row["route_context"] = route_context_summary
         overlap_rows = envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_OVERLAP_ROWS
         if combined_indices is not None and overlap_rows > 0:
             row["candidate_overlap"] = _sparse_mla_candidate_overlap_summary(
@@ -1424,11 +1440,18 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
         indexed_d512_split_prefill = False
         indexed_d512_chunked_prefill = False
+        prefill_route_query_chunk_size = 0
+        compressed_block_size = 0
+        swa_block_size = int(swa_metadata.block_size)
+        if not swa_only:
+            assert attn_metadata is not None
+            compressed_block_size = int(attn_metadata.block_size // self.compress_ratio)
         if triton_sparse_mla_enabled:
             query_chunk_size = min(
                 max_query_chunk_tokens,
                 triton_sparse_mla_query_chunk_size(),
             )
+            prefill_route_query_chunk_size = int(query_chunk_size)
             indexed_d512_split_prefill = _use_indexed_d512_split_prefill(
                 compress_ratio=int(self.compress_ratio),
                 head_dim=int(self.head_dim),
@@ -1655,4 +1678,25 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         if stage_timer is not None
                         else None
                     ),
+                    route_context={
+                        "compressed_block_size": compressed_block_size,
+                        "has_cached_prefix": has_cached_prefix,
+                        "indexed_d512_chunked_prefill": indexed_d512_chunked_prefill,
+                        "indexed_d512_fused_sink_prefill": (
+                            _use_indexed_d512_fused_sink_prefill(
+                                split_prefill=indexed_d512_split_prefill,
+                            )
+                        ),
+                        "indexed_d512_split_prefill": indexed_d512_split_prefill,
+                        "prefill_state_buffer_count": (
+                            len(prefill_state_buffers)
+                            if prefill_state_buffers is not None
+                            else 0
+                        ),
+                        "query_chunk_size": prefill_route_query_chunk_size,
+                        "swa_block_size": swa_block_size,
+                        "swa_only": swa_only,
+                        "top_k": int(top_k),
+                        "triton_sparse_mla_enabled": triton_sparse_mla_enabled,
+                    },
                 )
