@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.models.deepseek_v4 import sparse_mla
 from vllm.models.deepseek_v4.nvidia import flashmla
 
@@ -83,6 +84,78 @@ def test_indexed_d512_split_prefill_respects_min_token_env(monkeypatch) -> None:
         raising=False,
     )
     assert flashmla._use_indexed_d512_split_prefill(**kwargs)
+
+
+def test_indexed_d512_split_prefill_default_allows_runtime_4096(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL",
+        True,
+    )
+    monkeypatch.delattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS",
+        raising=False,
+    )
+    kwargs = {
+        "compress_ratio": 4,
+        "head_dim": 512,
+        "num_prefills": 1,
+        "combined_topk": 640,
+        "max_prefill_seq_len": 4096,
+        "swa_only": False,
+    }
+
+    with override_forward_context(
+        ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+    ):
+        assert flashmla._use_indexed_d512_split_prefill(**kwargs)
+        assert flashmla._use_indexed_d512_chunked_prefill(
+            **{**kwargs, "combined_topk": 1280}
+        )
+
+
+def test_indexed_d512_split_prefill_skips_dummy_profile_context(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL",
+        True,
+    )
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS",
+        4096,
+        raising=False,
+    )
+    kwargs = {
+        "compress_ratio": 4,
+        "head_dim": 512,
+        "num_prefills": 1,
+        "combined_topk": 640,
+        "max_prefill_seq_len": 4096,
+        "swa_only": False,
+    }
+
+    with override_forward_context(
+        ForwardContext(
+            no_compile_layers={},
+            attn_metadata={},
+            slot_mapping={},
+            additional_kwargs={"is_dummy_run": True, "is_profile": True},
+        )
+    ):
+        assert not flashmla._use_indexed_d512_split_prefill(**kwargs)
+        assert not flashmla._use_indexed_d512_chunked_prefill(
+            **{**kwargs, "combined_topk": 1280}
+        )
 
 
 def test_indexed_d512_fused_sink_prefill_defaults_off() -> None:

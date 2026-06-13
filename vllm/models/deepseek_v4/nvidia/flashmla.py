@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 
 
 _sparse_mla_prefill_stats_disable_depth = 0
-_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS = 8192
+_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS = 4096
 _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK = 256
 _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK = 1152
 
@@ -476,12 +476,27 @@ def _use_indexed_d512_split_prefill(
 ) -> bool:
     return (
         envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
+        and not _is_startup_or_cudagraph_forward()
         and not swa_only
         and compress_ratio in (4, 128)
         and head_dim == 512
         and num_prefills == 1
         and _is_indexed_d512_split_topk(combined_topk)
         and max_prefill_seq_len >= _indexed_d512_split_prefill_min_tokens()
+    )
+
+
+def _is_startup_or_cudagraph_forward() -> bool:
+    try:
+        forward_context = get_forward_context()
+    except AssertionError:
+        return False
+    if forward_context.cudagraph_runtime_mode.name != "NONE":
+        return True
+    return bool(
+        forward_context.additional_kwargs.get("is_dummy_run")
+        or forward_context.additional_kwargs.get("is_profile")
+        or forward_context.additional_kwargs.get("is_graph_capturing")
     )
 
 
@@ -553,6 +568,7 @@ def _use_indexed_d512_chunked_prefill(
     return (
         envs.VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL
         and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
+        and not _is_startup_or_cudagraph_forward()
         and not swa_only
         and compress_ratio in (4, 128)
         and head_dim == 512
