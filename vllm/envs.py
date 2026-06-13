@@ -183,6 +183,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL: bool = True
     VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS: int = 4096
     VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL: bool = True
+    VLLM_MXFP4_MOE_POST_LOAD_MEMORY_DEBUG: bool = False
+    VLLM_MXFP4_MOE_POST_LOAD_EARLY_CACHE_RELEASE: bool = False
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
     VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
@@ -1444,6 +1446,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL", "1"))
     ),
+    "VLLM_MXFP4_MOE_POST_LOAD_MEMORY_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_MXFP4_MOE_POST_LOAD_MEMORY_DEBUG", "0"))
+    ),
+    "VLLM_MXFP4_MOE_POST_LOAD_EARLY_CACHE_RELEASE": lambda: bool(
+        int(os.getenv("VLLM_MXFP4_MOE_POST_LOAD_EARLY_CACHE_RELEASE", "0"))
+    ),
     # Experimental sparse MLA fallback controls.
     # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse
     # is unavailable; set 0/1 to force-disable/force-enable the fallback.
@@ -2091,6 +2099,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_MXFP4_MOE_POST_LOAD_EARLY_CACHE_RELEASE",
+        "VLLM_MXFP4_MOE_POST_LOAD_MEMORY_DEBUG",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",

@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -36,6 +37,8 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
 
+_BYTES_PER_GIB = 1024**3
+
 
 def _clear_mxfp4_moe_weight_loading_cache() -> None:
     # WORKAROUND: SM12x/GB10 can hit driver instability while loading MXFP4
@@ -43,6 +46,80 @@ def _clear_mxfp4_moe_weight_loading_cache() -> None:
     # after the backend kernel has taken ownership of the converted weights.
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _get_mxfp4_moe_post_load_memory_stats() -> dict[str, float]:
+    if not torch.cuda.is_available():
+        return {}
+
+    device = torch.cuda.current_device()
+    stats: dict[str, float] = {}
+    try:
+        stats["allocated_gib"] = torch.cuda.memory_allocated(device) / _BYTES_PER_GIB
+        stats["reserved_gib"] = torch.cuda.memory_reserved(device) / _BYTES_PER_GIB
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        stats["free_gib"] = free_bytes / _BYTES_PER_GIB
+        stats["total_gib"] = total_bytes / _BYTES_PER_GIB
+    except RuntimeError:
+        logger.debug("Unable to read CUDA memory stats", exc_info=True)
+
+    try:
+        import psutil
+
+        host_mem = psutil.virtual_memory()
+        stats["host_available_gib"] = host_mem.available / _BYTES_PER_GIB
+        stats["host_total_gib"] = host_mem.total / _BYTES_PER_GIB
+    except Exception:
+        logger.debug("Unable to read host memory stats", exc_info=True)
+
+    return stats
+
+
+def _format_mxfp4_moe_memory_stat(stats: dict[str, float], key: str) -> str:
+    value = stats.get(key)
+    if value is None:
+        return "n/a"
+    return f"{value:.2f}GiB"
+
+
+def _mxfp4_moe_layer_name(layer: RoutedExperts) -> str:
+    return getattr(layer, "layer_name", layer.__class__.__name__)
+
+
+def _log_mxfp4_moe_post_load_memory(layer: RoutedExperts, stage: str) -> None:
+    if not envs.VLLM_MXFP4_MOE_POST_LOAD_MEMORY_DEBUG:
+        return
+
+    stats = _get_mxfp4_moe_post_load_memory_stats()
+    logger.info(
+        "MXFP4 MoE post-load memory stage=%s layer=%s allocated=%s "
+        "reserved=%s free=%s total=%s host_available=%s host_total=%s",
+        stage,
+        _mxfp4_moe_layer_name(layer),
+        _format_mxfp4_moe_memory_stat(stats, "allocated_gib"),
+        _format_mxfp4_moe_memory_stat(stats, "reserved_gib"),
+        _format_mxfp4_moe_memory_stat(stats, "free_gib"),
+        _format_mxfp4_moe_memory_stat(stats, "total_gib"),
+        _format_mxfp4_moe_memory_stat(stats, "host_available_gib"),
+        _format_mxfp4_moe_memory_stat(stats, "host_total_gib"),
+    )
+
+
+def _maybe_release_mxfp4_moe_post_load_cache(
+    stage: str,
+    *,
+    force: bool = False,
+) -> None:
+    if not force and not envs.VLLM_MXFP4_MOE_POST_LOAD_EARLY_CACHE_RELEASE:
+        return
+    if not torch.cuda.is_available():
+        return
+
+    if envs.VLLM_MXFP4_MOE_POST_LOAD_EARLY_CACHE_RELEASE:
+        torch.cuda.synchronize()
+    _clear_mxfp4_moe_weight_loading_cache()
+    if envs.VLLM_MXFP4_MOE_POST_LOAD_MEMORY_DEBUG:
+        logger.info("MXFP4 MoE post-load cache release stage=%s", stage)
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -694,6 +771,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 _cache_permute_indices=self._cache_permute_indices,
             )
         )
+        _log_mxfp4_moe_post_load_memory(layer, "after_kernel_format_conversion")
 
         # For TRITON backends, weights are wrapped tensors from triton_kernels
         # that don't support .detach(). Manually assign parameters.
@@ -716,6 +794,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
+
+        _log_mxfp4_moe_post_load_memory(layer, "after_weight_replace")
+        _maybe_release_mxfp4_moe_post_load_cache("after_weight_replace")
 
         # Build quant config
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
@@ -742,9 +823,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 
-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+        _log_mxfp4_moe_post_load_memory(layer, "before_setup")
+        _maybe_release_mxfp4_moe_post_load_cache("before_setup")
+        try:
+            self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+        except Exception:
+            _log_mxfp4_moe_post_load_memory(layer, "setup_exception")
+            raise
+        _log_mxfp4_moe_post_load_memory(layer, "after_setup")
         del w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
-        _clear_mxfp4_moe_weight_loading_cache()
+        _maybe_release_mxfp4_moe_post_load_cache("after_setup", force=True)
+        _log_mxfp4_moe_post_load_memory(layer, "after_cache_release")
 
     def get_fused_moe_quant_config(
         self,
