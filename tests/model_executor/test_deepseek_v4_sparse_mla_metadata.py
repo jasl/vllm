@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.models.deepseek_v4 import sparse_mla
 from vllm.models.deepseek_v4.nvidia import flashmla
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def test_c128a_effective_topk_width_uses_current_positions() -> None:
@@ -170,3 +173,57 @@ def test_prefill_has_cached_prefix_accepts_prefill_only_seq_lens() -> None:
         num_decodes=1,
         num_prefills=3,
     )
+
+
+def test_direct_paged_prefill_requires_env_and_single_d512_no_prefix(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_DIRECT_PAGED_PREFILL",
+        False,
+        raising=False,
+    )
+    kwargs = {
+        "compress_ratio": 4,
+        "head_dim": 512,
+        "num_prefills": 1,
+        "swa_only": False,
+        "has_cached_prefix": False,
+    }
+    assert not flashmla._use_direct_paged_prefill(**kwargs)
+
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_DIRECT_PAGED_PREFILL",
+        True,
+        raising=False,
+    )
+    assert flashmla._use_direct_paged_prefill(**kwargs)
+    assert not flashmla._use_direct_paged_prefill(
+        **{**kwargs, "num_prefills": 2}
+    )
+    assert not flashmla._use_direct_paged_prefill(
+        **{**kwargs, "head_dim": 256}
+    )
+    assert not flashmla._use_direct_paged_prefill(
+        **{**kwargs, "swa_only": True}
+    )
+    assert not flashmla._use_direct_paged_prefill(
+        **{**kwargs, "has_cached_prefix": True}
+    )
+
+
+def test_direct_paged_prefill_lens_cpu_matches_token_positions() -> None:
+    lens = flashmla._direct_paged_prefill_lens_cpu(
+        query_start_loc_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([2, 9], dtype=torch.int32),
+        num_decodes=0,
+        chunk_start=0,
+        chunk_end=2,
+        top_k=4,
+        compress_ratio=4,
+        window_size=3,
+    )
+
+    assert lens.tolist() == [1, 2, 4, 5, 5]

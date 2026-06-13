@@ -47,6 +47,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
+    fp8ds_global_paged_sparse_mla_prefill_with_sink_multihead,
     fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     matmul_sparse_mla_attention_with_sink,
     sparse_mla_decode_head_block_size,
@@ -517,6 +518,54 @@ def _use_indexed_d512_fused_sink_prefill(*, split_prefill: bool) -> bool:
     )
 
 
+def _use_direct_paged_prefill(
+    *,
+    compress_ratio: int,
+    head_dim: int,
+    num_prefills: int,
+    swa_only: bool,
+    has_cached_prefix: bool = False,
+) -> bool:
+    return (
+        envs.VLLM_DEEPSEEK_V4_DIRECT_PAGED_PREFILL
+        and not swa_only
+        and not has_cached_prefix
+        and num_prefills == 1
+        and compress_ratio in (4, 128)
+        and head_dim == 512
+    )
+
+
+def _direct_paged_prefill_lens_cpu(
+    *,
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    num_decodes: int,
+    chunk_start: int,
+    chunk_end: int,
+    top_k: int,
+    compress_ratio: int,
+    window_size: int,
+) -> torch.Tensor:
+    lens: list[int] = []
+    for prefill_idx in range(chunk_start, chunk_end):
+        req_idx = num_decodes + prefill_idx
+        query_start = int(query_start_loc_cpu[req_idx].item())
+        query_end = int(query_start_loc_cpu[req_idx + 1].item())
+        query_len = query_end - query_start
+        if seq_lens_cpu.numel() >= query_start_loc_cpu.numel() - 1:
+            seq_len = int(seq_lens_cpu[req_idx].item())
+        else:
+            seq_len = int(seq_lens_cpu[prefill_idx].item())
+        prefix_len = seq_len - query_len
+        for token_idx in range(query_start, query_end):
+            pos = prefix_len + token_idx - query_start
+            topk_len = min((pos + 1) // compress_ratio, top_k)
+            swa_len = min(pos + 1, window_size)
+            lens.append(topk_len + swa_len)
+    return torch.tensor(lens, dtype=torch.int32)
+
+
 def _prefill_has_cached_prefix(
     *,
     seq_lens_cpu: torch.Tensor,
@@ -644,11 +693,14 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         cls,
         *,
         triton_sparse_mla_enabled: bool,
-        indexed_d512_split_prefill: bool,
+        direct_paged_prefill: bool = False,
+        indexed_d512_split_prefill: bool = False,
         indexed_d512_chunked_prefill: bool = False,
     ) -> str:
         if not triton_sparse_mla_enabled:
             return "mla_prefill_flashmla"
+        if direct_paged_prefill:
+            return "mla_prefill_direct_paged"
         if indexed_d512_chunked_prefill:
             return "mla_prefill_indexed_d512_chunked"
         if indexed_d512_split_prefill:
@@ -1072,6 +1124,48 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             output[:, layer.n_local_heads :].zero_()
 
     @classmethod
+    def _forward_direct_paged_prefill_triton(
+        cls,
+        layer: "DeepseekV4FlashMLAAttention",
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor,
+        local_topk_indices: torch.Tensor,
+        compressed_block_table: torch.Tensor,
+        compressed_block_size: int,
+        swa_k_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        token_to_req_indices: torch.Tensor,
+        swa_block_table: torch.Tensor,
+        swa_block_size: int,
+        full_token_offset: int,
+        output: torch.Tensor,
+    ) -> None:
+        fp8ds_global_paged_sparse_mla_prefill_with_sink_multihead(
+            q=q,
+            compressed_k_cache=compressed_k_cache,
+            local_topk_indices=local_topk_indices,
+            compressed_block_table=compressed_block_table,
+            compressed_block_size=compressed_block_size,
+            swa_k_cache=swa_k_cache,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            token_to_req_indices=token_to_req_indices,
+            swa_block_table=swa_block_table,
+            swa_block_size=swa_block_size,
+            full_token_offset=full_token_offset,
+            num_compressed_candidates=local_topk_indices.shape[-1],
+            window_size=layer.window_size,
+            compress_ratio=layer.compress_ratio,
+            scale=layer.scale,
+            attn_sink=layer.attn_sink,
+            output=output,
+            num_heads=layer.n_local_heads,
+        )
+        if output.shape[1] > layer.n_local_heads:
+            output[:, layer.n_local_heads :].zero_()
+
+    @classmethod
     def _forward_sparse_mla_prefill_triton(
         cls,
         layer: "DeepseekV4FlashMLAAttention",
@@ -1438,6 +1532,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
 
         workspace_manager = current_workspace_manager()
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
+        direct_paged_prefill = False
         indexed_d512_split_prefill = False
         indexed_d512_chunked_prefill = False
         prefill_route_query_chunk_size = 0
@@ -1452,16 +1547,24 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 triton_sparse_mla_query_chunk_size(),
             )
             prefill_route_query_chunk_size = int(query_chunk_size)
-            indexed_d512_split_prefill = _use_indexed_d512_split_prefill(
+            direct_paged_prefill = _use_direct_paged_prefill(
                 compress_ratio=int(self.compress_ratio),
                 head_dim=int(self.head_dim),
                 num_prefills=int(num_prefills),
-                combined_topk=int(combined_topk),
-                max_prefill_seq_len=max_prefill_seq_len,
                 swa_only=swa_only,
                 has_cached_prefix=has_cached_prefix,
             )
-            if not indexed_d512_split_prefill:
+            if not direct_paged_prefill:
+                indexed_d512_split_prefill = _use_indexed_d512_split_prefill(
+                    compress_ratio=int(self.compress_ratio),
+                    head_dim=int(self.head_dim),
+                    num_prefills=int(num_prefills),
+                    combined_topk=int(combined_topk),
+                    max_prefill_seq_len=max_prefill_seq_len,
+                    swa_only=swa_only,
+                    has_cached_prefix=has_cached_prefix,
+                )
+            if not direct_paged_prefill and not indexed_d512_split_prefill:
                 indexed_d512_chunked_prefill = _use_indexed_d512_chunked_prefill(
                     compress_ratio=int(self.compress_ratio),
                     head_dim=int(self.head_dim),
@@ -1498,6 +1601,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         ),
                     )
                 )
+        if triton_sparse_mla_enabled and direct_paged_prefill:
+            kv = None
+            combined_indices_buffer = None
+            combined_lens_buffer = None
+            prefill_state_buffers = None
+        elif triton_sparse_mla_enabled:
             (
                 kv,
                 combined_indices_buffer,
@@ -1542,6 +1651,112 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             chunk_start = chunk_idx * chunk_size_const
             chunk_end = min(chunk_start + chunk_size_const, num_prefills)
             chunk_size = chunk_end - chunk_start
+            query_start = int(
+                (
+                    query_start_loc_cpu[num_decodes + chunk_start]
+                    - prefill_token_base
+                ).item()
+            )
+            query_end = int(
+                (
+                    query_start_loc_cpu[num_decodes + chunk_end]
+                    - prefill_token_base
+                ).item()
+            )
+            if direct_paged_prefill:
+                assert not swa_only
+                assert compressed_k_cache is not None
+                assert attn_metadata is not None
+                assert swa_metadata.seq_lens is not None
+                assert swa_metadata.token_to_req_indices is not None
+                with (
+                    stage_timer.stage("sparse_accumulate")
+                    if stage_timer is not None
+                    else nullcontext()
+                ):
+                    self._forward_direct_paged_prefill_triton(
+                        self,
+                        q=q[query_start:query_end],
+                        compressed_k_cache=compressed_k_cache,
+                        local_topk_indices=topk_indices[query_start:query_end],
+                        compressed_block_table=attn_metadata.block_table,
+                        compressed_block_size=compressed_block_size,
+                        swa_k_cache=swa_k_cache,
+                        seq_lens=swa_metadata.seq_lens,
+                        query_start_loc=query_start_loc,
+                        token_to_req_indices=swa_metadata.token_to_req_indices,
+                        swa_block_table=swa_metadata.block_table,
+                        swa_block_size=swa_block_size,
+                        full_token_offset=int(num_decode_tokens + query_start),
+                        output=output[query_start:query_end],
+                    )
+                if write_stats:
+                    compressed_visits, swa_visits = (
+                        _sparse_mla_prefill_candidate_region_visits(
+                            query_start_loc_cpu=query_start_loc_cpu,
+                            seq_lens_cpu=seq_lens_cpu,
+                            num_decodes=num_decodes,
+                            chunk_start=chunk_start,
+                            chunk_end=chunk_end,
+                            top_k=top_k,
+                            compress_ratio=self.compress_ratio,
+                            window_size=self.window_size,
+                        )
+                    )
+                    combined_lens = _direct_paged_prefill_lens_cpu(
+                        query_start_loc_cpu=query_start_loc_cpu,
+                        seq_lens_cpu=seq_lens_cpu,
+                        num_decodes=int(num_decodes),
+                        chunk_start=chunk_start,
+                        chunk_end=chunk_end,
+                        top_k=int(top_k),
+                        compress_ratio=int(self.compress_ratio),
+                        window_size=int(self.window_size),
+                    )
+                    _write_sparse_mla_prefill_stats(
+                        layer_type=self._prefill_stats_layer_type(
+                            triton_sparse_mla_enabled=triton_sparse_mla_enabled,
+                            direct_paged_prefill=direct_paged_prefill,
+                        ),
+                        layer_prefix=self.prefix,
+                        compress_ratio=self.compress_ratio,
+                        num_prefills=chunk_size,
+                        max_prefill_seq_len=max_prefill_seq_len,
+                        query_tokens=int(query_end - query_start),
+                        combined_topk=int(top_k + self.window_size),
+                        combined_lens=combined_lens,
+                        combined_indices=None,
+                        gather_region_size=0,
+                        swa_region_offset=0,
+                        compressed_region_width=top_k,
+                        swa_region_width=self.window_size,
+                        compressed_candidate_visits=compressed_visits,
+                        swa_candidate_visits=swa_visits,
+                        stage_timings_ms=(
+                            stage_timer.elapsed_ms()
+                            if stage_timer is not None
+                            else None
+                        ),
+                        route_context={
+                            "compressed_block_size": compressed_block_size,
+                            "direct_paged_prefill": direct_paged_prefill,
+                            "has_cached_prefix": has_cached_prefix,
+                            "indexed_d512_chunked_prefill": False,
+                            "indexed_d512_fused_sink_prefill": False,
+                            "indexed_d512_split_prefill": False,
+                            "prefill_state_buffer_count": 0,
+                            "query_chunk_size": prefill_route_query_chunk_size,
+                            "swa_block_size": swa_block_size,
+                            "swa_only": swa_only,
+                            "top_k": int(top_k),
+                            "triton_sparse_mla_enabled": triton_sparse_mla_enabled,
+                        },
+                    )
+                continue
+
+            assert kv is not None
+            assert combined_indices_buffer is not None
+            assert combined_lens_buffer is not None
             if not swa_only:
                 # Gather compressed KV
                 assert attn_metadata is not None
@@ -1581,13 +1796,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 )
 
             # Combine the topk indices and SWA indices for gathered KV cache
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
-
             with (
                 stage_timer.stage("combine_indices")
                 if stage_timer is not None
@@ -1654,6 +1862,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 _write_sparse_mla_prefill_stats(
                     layer_type=self._prefill_stats_layer_type(
                         triton_sparse_mla_enabled=triton_sparse_mla_enabled,
+                        direct_paged_prefill=direct_paged_prefill,
                         indexed_d512_split_prefill=indexed_d512_split_prefill,
                         indexed_d512_chunked_prefill=(
                             indexed_d512_chunked_prefill
@@ -1680,6 +1889,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     ),
                     route_context={
                         "compressed_block_size": compressed_block_size,
+                        "direct_paged_prefill": direct_paged_prefill,
                         "has_cached_prefix": has_cached_prefix,
                         "indexed_d512_chunked_prefill": indexed_d512_chunked_prefill,
                         "indexed_d512_fused_sink_prefill": (

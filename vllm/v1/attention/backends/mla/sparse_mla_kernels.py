@@ -3403,6 +3403,320 @@ def fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
 
 
 @triton.jit
+def _fp8ds_global_paged_prefill_with_sink_multihead_kernel(
+    q_ptr,
+    compressed_k_cache_ptr,
+    local_topk_indices_ptr,
+    swa_k_cache_ptr,
+    seq_lens_ptr,
+    query_start_loc_ptr,
+    token_to_req_indices_ptr,
+    compressed_block_table_ptr,
+    swa_block_table_ptr,
+    sink_ptr,
+    output_ptr,
+    stride_q_t: tl.constexpr,
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    stride_topk_t: tl.constexpr,
+    stride_topk_c: tl.constexpr,
+    stride_compressed_block_table_t,
+    stride_swa_block_table_t,
+    stride_output_t: tl.constexpr,
+    stride_output_h: tl.constexpr,
+    stride_output_d: tl.constexpr,
+    compressed_cache_block_size: tl.constexpr,
+    compressed_block_stride: tl.constexpr,
+    swa_cache_block_size: tl.constexpr,
+    swa_block_stride: tl.constexpr,
+    token_data_size: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    scale_dim: tl.constexpr,
+    quant_block: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_compressed_candidates: tl.constexpr,
+    window_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    full_token_offset,
+    scale: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+    head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    dim_offsets = tl.arange(0, BLOCK_D)
+    head_mask = head_offsets < num_heads
+    dim_mask = dim_offsets < head_dim
+    matrix_mask = head_mask[:, None] & dim_mask[None, :]
+
+    q = tl.load(
+        q_ptr
+        + token_idx * stride_q_t
+        + head_offsets[:, None] * stride_q_h
+        + dim_offsets[None, :] * stride_q_d,
+        mask=matrix_mask,
+        other=0.0,
+    ).to(tl.float32)
+    running_max = tl.full((HEAD_BLOCK,), -float("inf"), tl.float32)
+    running_denom = tl.zeros((HEAD_BLOCK,), tl.float32)
+    running_acc = tl.zeros((HEAD_BLOCK, BLOCK_D), tl.float32)
+
+    fp8_mask = dim_offsets < fp8_dim
+    rope_mask = (dim_offsets >= fp8_dim) & dim_mask
+    rope_offsets = tl.maximum(dim_offsets - fp8_dim, 0)
+
+    full_token_idx = full_token_offset + token_idx
+    req_idx = tl.load(token_to_req_indices_ptr + full_token_idx)
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+    pos = prefix_len + full_token_idx - query_start
+    topk_len = tl.minimum((pos + 1) // compress_ratio, num_compressed_candidates)
+
+    for candidate_idx in range(0, num_compressed_candidates):
+        local_idx = tl.load(
+            local_topk_indices_ptr
+            + token_idx * stride_topk_t
+            + candidate_idx * stride_topk_c
+        )
+        is_valid = (candidate_idx < topk_len) & (local_idx >= 0)
+        if is_valid:
+            block_idx = local_idx // compressed_cache_block_size
+            pos_in_block = local_idx % compressed_cache_block_size
+            physical_block = tl.load(
+                compressed_block_table_ptr
+                + req_idx * stride_compressed_block_table_t
+                + block_idx
+            )
+            cache_block_ptr = (
+                compressed_k_cache_ptr
+                + physical_block.to(tl.int64) * compressed_block_stride
+            )
+            token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+            token_scale_ptr = (
+                cache_block_ptr
+                + compressed_cache_block_size * token_data_size
+                + pos_in_block * scale_dim
+            )
+
+            x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_float = x_fp8.to(tl.float32)
+            scale_offsets = dim_offsets // quant_block
+            encoded_scale = tl.load(
+                token_scale_ptr + scale_offsets,
+                mask=fp8_mask,
+                other=127,
+            )
+            dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+            x_dequant = x_float * dequant_scale
+            rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+            rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
+                tl.float32
+            )
+            kv = tl.where(fp8_mask, x_dequant, rope)
+            kv = tl.where(dim_mask, kv, 0.0)
+
+            score = tl.sum(q * kv[None, :], axis=1) * scale
+            next_max = tl.maximum(running_max, score)
+            previous_weight = tl.exp(running_max - next_max)
+            candidate_weight = tl.exp(score - next_max)
+            running_acc = (
+                running_acc * previous_weight[:, None]
+                + kv[None, :] * candidate_weight[:, None]
+            )
+            running_denom = running_denom * previous_weight + candidate_weight
+            running_max = next_max
+
+    swa_len = tl.minimum(pos + 1, window_size)
+    swa_start_pos = pos - swa_len + 1
+    for candidate_idx in range(0, window_size):
+        is_valid = candidate_idx < swa_len
+        if is_valid:
+            swa_pos = swa_start_pos + candidate_idx
+            block_idx = swa_pos // swa_cache_block_size
+            pos_in_block = swa_pos % swa_cache_block_size
+            physical_block = tl.load(
+                swa_block_table_ptr + req_idx * stride_swa_block_table_t + block_idx
+            )
+            cache_block_ptr = (
+                swa_k_cache_ptr + physical_block.to(tl.int64) * swa_block_stride
+            )
+            token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+            token_scale_ptr = (
+                cache_block_ptr
+                + swa_cache_block_size * token_data_size
+                + pos_in_block * scale_dim
+            )
+
+            x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_float = x_fp8.to(tl.float32)
+            scale_offsets = dim_offsets // quant_block
+            encoded_scale = tl.load(
+                token_scale_ptr + scale_offsets,
+                mask=fp8_mask,
+                other=127,
+            )
+            dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+            x_dequant = x_float * dequant_scale
+            rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+            rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
+                tl.float32
+            )
+            kv = tl.where(fp8_mask, x_dequant, rope)
+            kv = tl.where(dim_mask, kv, 0.0)
+
+            score = tl.sum(q * kv[None, :], axis=1) * scale
+            next_max = tl.maximum(running_max, score)
+            previous_weight = tl.exp(running_max - next_max)
+            candidate_weight = tl.exp(score - next_max)
+            running_acc = (
+                running_acc * previous_weight[:, None]
+                + kv[None, :] * candidate_weight[:, None]
+            )
+            running_denom = running_denom * previous_weight + candidate_weight
+            running_max = next_max
+
+    sink = tl.load(sink_ptr + head_offsets, mask=head_mask, other=-float("inf"))
+    has_tokens = running_denom > 0.0
+    has_sink = sink > -float("inf")
+    valid_max = tl.where(has_tokens, running_max, -float("inf"))
+    valid_sink = tl.where(has_sink, sink, -float("inf"))
+    merge_max = tl.maximum(valid_max, valid_sink)
+    has_any = has_tokens | has_sink
+    safe_merge_max = tl.where(has_any, merge_max, 0.0)
+    safe_running_max = tl.where(has_tokens, running_max, safe_merge_max)
+    safe_sink = tl.where(has_sink, sink, safe_merge_max)
+    subset_scale = tl.where(has_tokens, tl.exp(safe_running_max - safe_merge_max), 0.0)
+    sink_weight = tl.where(has_sink, tl.exp(safe_sink - safe_merge_max), 0.0)
+    total_weight = running_denom * subset_scale + sink_weight
+    inv_total = tl.where(total_weight > 0.0, 1.0 / total_weight, 0.0)
+    final = running_acc * subset_scale[:, None] * inv_total[:, None]
+
+    tl.store(
+        output_ptr
+        + token_idx * stride_output_t
+        + head_offsets[:, None] * stride_output_h
+        + dim_offsets[None, :] * stride_output_d,
+        final,
+        mask=matrix_mask,
+    )
+
+
+def fp8ds_global_paged_sparse_mla_prefill_with_sink_multihead(
+    q: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    local_topk_indices: torch.Tensor,
+    compressed_block_table: torch.Tensor,
+    compressed_block_size: int,
+    swa_k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    swa_block_size: int,
+    full_token_offset: int,
+    num_compressed_candidates: int,
+    window_size: int,
+    compress_ratio: int,
+    scale: float,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+    head_block_size: int = 1,
+    num_heads: int | None = None,
+) -> None:
+    if q.dim() == 4:
+        assert q.shape[1] == 1
+        q = q[:, 0]
+
+    assert q.dim() == 3, f"Expected q shape [T, H, D], got {q.shape}"
+    assert q.shape[-1] == 512
+    assert local_topk_indices.dim() == 2
+    assert local_topk_indices.shape[0] == q.shape[0]
+    assert local_topk_indices.shape[1] >= num_compressed_candidates
+    assert compressed_block_table.dim() == 2
+    assert swa_block_table.dim() == 2
+    assert output.shape[0] == q.shape[0]
+    assert output.shape[2] == q.shape[-1]
+    assert head_block_size in (1, 2, 4)
+    assert compressed_k_cache.dtype == torch.uint8
+    assert swa_k_cache.dtype == torch.uint8
+    assert local_topk_indices.dtype == torch.int32
+    assert seq_lens.dtype == torch.int32
+    assert query_start_loc.dtype == torch.int32
+    assert token_to_req_indices.dtype == torch.int32
+    assert compressed_block_table.dtype == torch.int32
+    assert swa_block_table.dtype == torch.int32
+    assert q.is_cuda and compressed_k_cache.is_cuda and swa_k_cache.is_cuda
+    assert local_topk_indices.is_cuda and compressed_block_table.is_cuda
+    assert seq_lens.is_cuda and query_start_loc.is_cuda
+    assert token_to_req_indices.is_cuda and swa_block_table.is_cuda
+    assert attn_sink.is_cuda and output.is_cuda
+    assert compress_ratio in (4, 128)
+    assert num_compressed_candidates <= local_topk_indices.shape[1]
+
+    token_fp8_dim = 448
+    token_bf16_dim = 64
+    token_scale_dim = 8
+    quant_block_size = 64
+    token_data_size = token_fp8_dim + token_bf16_dim * 2
+
+    num_tokens, _, head_dim = q.shape
+    active_heads = num_heads if num_heads is not None else output.shape[1]
+    assert active_heads <= q.shape[1]
+    assert active_heads <= output.shape[1]
+    assert active_heads <= attn_sink.shape[0]
+    block_d = min(1024, next_power_of_2(head_dim))
+    grid = (num_tokens, triton.cdiv(active_heads, head_block_size))
+    _fp8ds_global_paged_prefill_with_sink_multihead_kernel[grid](
+        q,
+        compressed_k_cache,
+        local_topk_indices,
+        swa_k_cache,
+        seq_lens,
+        query_start_loc,
+        token_to_req_indices,
+        compressed_block_table,
+        swa_block_table,
+        attn_sink,
+        output,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        local_topk_indices.stride(0),
+        local_topk_indices.stride(1),
+        compressed_block_table.stride(0),
+        swa_block_table.stride(0),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        compressed_block_size,
+        compressed_k_cache.stride(0),
+        swa_block_size,
+        swa_k_cache.stride(0),
+        token_data_size,
+        token_fp8_dim,
+        token_scale_dim,
+        quant_block_size,
+        active_heads,
+        head_dim,
+        num_compressed_candidates,
+        window_size,
+        compress_ratio,
+        full_token_offset,
+        scale,
+        HEAD_BLOCK=head_block_size,
+        BLOCK_D=block_d,
+        num_warps=8,
+    )
+
+
+@triton.jit
 def _finish_attention_state_kernel(
     max_score_ptr,
     denom_ptr,

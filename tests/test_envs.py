@@ -36,6 +36,7 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
+@pytest.mark.skip_global_cleanup
 def test_deepseek_v4_sparse_mla_stats_path_env(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -55,6 +56,7 @@ def test_deepseek_v4_sparse_mla_stats_path_env(
     assert envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH == "/tmp/sparse_mla_stats"
 
 
+@pytest.mark.skip_global_cleanup
 def test_deepseek_v4_indexed_d512_multi_prefill_env(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -72,6 +74,26 @@ def test_deepseek_v4_indexed_d512_multi_prefill_env(
         envs.__getattr__.cache_clear()
 
     assert envs.VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL is True
+
+
+@pytest.mark.skip_global_cleanup
+def test_deepseek_v4_direct_paged_prefill_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv(
+        "VLLM_DEEPSEEK_V4_DIRECT_PAGED_PREFILL",
+        raising=False,
+    )
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+    assert envs.VLLM_DEEPSEEK_V4_DIRECT_PAGED_PREFILL is False
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_DIRECT_PAGED_PREFILL", "1")
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+    assert envs.VLLM_DEEPSEEK_V4_DIRECT_PAGED_PREFILL is True
 
 
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
