@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 import json
 import math
 from collections.abc import Iterator
@@ -14,6 +15,7 @@ import vllm.envs as envs
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
+    build_flashinfer_mixed_sparse_indices,
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
@@ -65,6 +67,56 @@ _sparse_mla_prefill_stats_disable_depth = 0
 _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS = 8192
 _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK = 256
 _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK = 1152
+
+
+def _flashinfer_packed_sparse_mla_attention():
+    try:
+        module = importlib.import_module("flashinfer.sparse_mla_sm120")
+    except Exception:
+        return None
+    return getattr(module, "sparse_mla_sm120_paged_attention", None)
+
+
+def _use_flashinfer_packed_prefill(
+    *,
+    compress_ratio: int,
+    head_dim: int,
+    swa_only: bool,
+    query_tokens: int,
+    compressed_block_size: int,
+    swa_block_size: int,
+    q_device: torch.device,
+) -> bool:
+    return (
+        envs.VLLM_DEEPSEEK_V4_FLASHINFER_PACKED_PREFILL
+        and not swa_only
+        and q_device.type == "cuda"
+        and compress_ratio in (4, 128)
+        and head_dim == 512
+        and query_tokens > 64
+        and swa_block_size == 64
+        and compressed_block_size in (2, 64)
+    )
+
+
+def _flashinfer_packed_prefill_workspace_specs(
+    *,
+    query_tokens: int,
+    combined_topk: int,
+    window_size: int,
+    num_heads: int,
+    head_dim: int,
+) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    extra_topk = max(0, int(combined_topk) - int(window_size))
+    return (
+        ((query_tokens, window_size), torch.int32),
+        ((query_tokens, extra_topk), torch.int32),
+        ((query_tokens,), torch.int32),
+        ((query_tokens,), torch.int32),
+        ((query_tokens, num_heads), torch.float32),
+        ((query_tokens, num_heads, head_dim), torch.bfloat16),
+        ((query_tokens, num_heads, head_dim), torch.bfloat16),
+    )
 
 
 @contextmanager
@@ -673,6 +725,20 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             ((max_query_chunk_tokens, combined_topk), torch.int32),
             ((max_query_chunk_tokens,), torch.int32),
         ]
+        packed_prefill_specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] = ()
+        if (
+            envs.VLLM_DEEPSEEK_V4_FLASHINFER_PACKED_PREFILL
+            and compress_ratio in (4, 128)
+            and head_dim == 512
+            and max_query_chunk_tokens > 64
+        ):
+            packed_prefill_specs = _flashinfer_packed_prefill_workspace_specs(
+                query_tokens=max_query_chunk_tokens,
+                combined_topk=combined_topk,
+                window_size=window_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
         if is_triton_sparse_mla_enabled_for_platform():
             query_chunk_size = min(
                 max_query_chunk_tokens,
@@ -719,6 +785,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         ((query_chunk_size, num_heads, head_dim), torch.float32),
                     )
                 )
+        specs.extend(packed_prefill_specs)
         return tuple(specs)
 
     @classmethod
@@ -1340,6 +1407,175 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             out=output.unsqueeze(1),
         )
 
+    @classmethod
+    def _try_forward_flashinfer_packed_prefill(
+        cls,
+        layer: "DeepseekV4FlashMLAAttention",
+        *,
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: DeepseekV4FlashMLAMetadata | None,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        topk_indices: torch.Tensor,
+        top_k: int,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        chunk_start: int,
+        chunk_end: int,
+        query_start: int,
+        query_end: int,
+        combined_indices_buffer: torch.Tensor,
+        combined_lens_buffer: torch.Tensor,
+        packed_prefill_buffers: tuple[torch.Tensor, ...],
+        write_stats: bool,
+        stage_timer: _SparseMLAPrefillStageTimer | None,
+    ) -> bool:
+        if compressed_k_cache is None or attn_metadata is None:
+            return False
+        if len(packed_prefill_buffers) != 7:
+            return False
+        compressed_block_size = attn_metadata.block_size // layer.compress_ratio
+        query_tokens = int(query_end - query_start)
+        if not _use_flashinfer_packed_prefill(
+            compress_ratio=int(layer.compress_ratio),
+            head_dim=int(layer.head_dim),
+            swa_only=False,
+            query_tokens=query_tokens,
+            compressed_block_size=int(compressed_block_size),
+            swa_block_size=int(swa_metadata.block_size),
+            q_device=q.device,
+        ):
+            return False
+        packed_attention = _flashinfer_packed_sparse_mla_attention()
+        if packed_attention is None:
+            return False
+
+        assert swa_metadata.block_table is not None
+        assert swa_metadata.token_to_req_indices is not None
+        req_start = num_decodes + chunk_start
+        req_end = num_decodes + chunk_end
+        full_token_start = num_decode_tokens + query_start
+        full_token_end = num_decode_tokens + query_end
+
+        base_query_start = query_start_loc[req_start]
+        local_query_start_loc = query_start_loc[req_start : req_end + 1]
+        local_query_start_loc = local_query_start_loc - base_query_start
+        token_to_req_indices = swa_metadata.token_to_req_indices[
+            full_token_start:full_token_end
+        ]
+        token_to_req_indices = token_to_req_indices - req_start
+
+        with (
+            stage_timer.stage("flashinfer_packed_indices")
+            if stage_timer is not None
+            else nullcontext()
+        ):
+            sparse_indices, _ = build_flashinfer_mixed_sparse_indices(
+                decode_swa_indices=combined_indices_buffer[:0, : layer.window_size],
+                decode_compressed_indices=None,
+                decode_compressed_topk_lens=None,
+                prefill_topk_indices=topk_indices[query_start:query_end],
+                query_start_loc=local_query_start_loc,
+                seq_lens=seq_lens[chunk_start:chunk_end],
+                token_to_req_indices=token_to_req_indices,
+                swa_block_table=swa_metadata.block_table[req_start:req_end],
+                swa_block_size=swa_metadata.block_size,
+                compressed_block_table=attn_metadata.block_table[req_start:req_end],
+                compressed_block_size=compressed_block_size,
+                window_size=layer.window_size,
+                compress_ratio=layer.compress_ratio,
+                topk=top_k,
+                sparse_indices=combined_indices_buffer,
+                sparse_topk_lens=combined_lens_buffer,
+            )
+
+        (
+            main_indices_buffer,
+            extra_indices_buffer,
+            main_lens_buffer,
+            extra_lens_buffer,
+            out_lse_buffer,
+            q_packed_buffer,
+            out_packed_buffer,
+        ) = packed_prefill_buffers
+        query_tokens = int(sparse_indices.shape[0])
+        extra_width = sparse_indices.shape[-1] - layer.window_size
+        main_indices = main_indices_buffer[:query_tokens]
+        extra_indices = extra_indices_buffer[:query_tokens, :extra_width]
+        main_lens = main_lens_buffer[:query_tokens]
+        extra_lens = extra_lens_buffer[:query_tokens]
+        out_lse = out_lse_buffer[:query_tokens]
+        q_packed = q_packed_buffer[:query_tokens]
+        out_packed = out_packed_buffer[:query_tokens]
+
+        main_indices.copy_(sparse_indices[:, : layer.window_size])
+        extra_indices.copy_(sparse_indices[:, layer.window_size :])
+        torch.sum(main_indices.ge(0), dim=1, dtype=torch.int32, out=main_lens)
+        torch.sum(extra_indices.ge(0), dim=1, dtype=torch.int32, out=extra_lens)
+
+        q_packed.copy_(q[query_start:query_end, : layer.n_local_heads])
+        with (
+            stage_timer.stage("flashinfer_packed_attention")
+            if stage_timer is not None
+            else nullcontext()
+        ):
+            packed_attention(
+                q_packed,
+                swa_k_cache.unsqueeze(-2),
+                main_indices,
+                out_packed,
+                out_lse,
+                layer.scale,
+                d_v=512,
+                topk_length=main_lens,
+                attn_sink=layer.attn_sink[: layer.n_local_heads],
+                extra_kv_cache=compressed_k_cache.unsqueeze(-2),
+                extra_indices=extra_indices,
+                extra_topk_length=extra_lens,
+            )
+        output[query_start:query_end, : layer.n_local_heads].copy_(out_packed)
+        if output.shape[1] > layer.n_local_heads:
+            output[query_start:query_end, layer.n_local_heads :].zero_()
+
+        if write_stats:
+            combined_lens_buffer[:query_tokens].copy_(main_lens)
+            combined_lens_buffer[:query_tokens].add_(extra_lens)
+            compressed_visits, swa_visits = (
+                _sparse_mla_prefill_candidate_region_visits(
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    seq_lens_cpu=seq_lens_cpu,
+                    num_decodes=num_decodes,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    top_k=top_k,
+                    compress_ratio=layer.compress_ratio,
+                    window_size=layer.window_size,
+                )
+            )
+            _write_sparse_mla_prefill_stats(
+                layer_type="mla_prefill_flashinfer_packed",
+                layer_prefix=layer.prefix,
+                compress_ratio=layer.compress_ratio,
+                num_prefills=chunk_end - chunk_start,
+                query_tokens=query_tokens,
+                combined_topk=main_indices.shape[-1] + extra_indices.shape[-1],
+                combined_lens=combined_lens_buffer[:query_tokens],
+                compressed_region_width=top_k,
+                swa_region_width=layer.window_size,
+                compressed_candidate_visits=compressed_visits,
+                swa_candidate_visits=swa_visits,
+                stage_timings_ms=(
+                    stage_timer.elapsed_ms() if stage_timer is not None else None
+                ),
+            )
+        return True
+
     def _forward_prefill(
         self,
         q: torch.Tensor,
@@ -1419,11 +1655,32 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             num_decodes=int(num_decodes),
             num_prefills=int(num_prefills),
         )
+        packed_prefill_specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] = ()
+        if not swa_only and attn_metadata is not None:
+            packed_prefill_enabled = _use_flashinfer_packed_prefill(
+                compress_ratio=int(self.compress_ratio),
+                head_dim=int(self.head_dim),
+                swa_only=False,
+                query_tokens=int(max_query_chunk_tokens),
+                compressed_block_size=int(attn_metadata.block_size)
+                // int(self.compress_ratio),
+                swa_block_size=int(swa_metadata.block_size),
+                q_device=q.device,
+            )
+            if packed_prefill_enabled:
+                packed_prefill_specs = _flashinfer_packed_prefill_workspace_specs(
+                    query_tokens=max_query_chunk_tokens,
+                    combined_topk=combined_topk,
+                    window_size=self.window_size,
+                    num_heads=self.n_local_heads,
+                    head_dim=self.head_dim,
+                )
 
         workspace_manager = current_workspace_manager()
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
         indexed_d512_split_prefill = False
         indexed_d512_chunked_prefill = False
+        packed_prefill_buffers: tuple[torch.Tensor, ...] = ()
         if triton_sparse_mla_enabled:
             query_chunk_size = min(
                 max_query_chunk_tokens,
@@ -1448,9 +1705,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     swa_only=swa_only,
                     has_cached_prefix=has_cached_prefix,
                 )
-            extra_specs: list[tuple[tuple[int, ...], torch.dtype]] = []
+            indexed_d512_extra_specs: list[tuple[tuple[int, ...], torch.dtype]] = []
             if indexed_d512_split_prefill:
-                extra_specs.append(
+                indexed_d512_extra_specs.append(
                     (
                         (query_chunk_size, self.n_local_heads, combined_topk),
                         torch.float32,
@@ -1461,7 +1718,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     combined_topk,
                     _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK,
                 )
-                extra_specs.extend(
+                indexed_d512_extra_specs.extend(
                     (
                         (
                             (query_chunk_size, self.n_local_heads, chunked_score_width),
@@ -1490,24 +1747,35 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 ((query_chunk_size, self.n_local_heads), torch.float32),
                 ((query_chunk_size, self.n_local_heads), torch.float32),
                 ((query_chunk_size, self.n_local_heads, q.shape[-1]), torch.float32),
-                *extra_specs,
+                *indexed_d512_extra_specs,
+                *packed_prefill_specs,
+            )
+            indexed_d512_extra_count = len(indexed_d512_extra_specs)
+            indexed_d512_state_buffers = tuple(
+                extra_state_buffers[:indexed_d512_extra_count]
+            )
+            packed_prefill_buffers = tuple(
+                extra_state_buffers[indexed_d512_extra_count:]
             )
             prefill_state_buffers = (
                 max_score_buffer,
                 denom_buffer,
                 output_buffer,
-                *extra_state_buffers,
+                *indexed_d512_state_buffers,
             )
         else:
             (
                 kv,
                 combined_indices_buffer,
                 combined_lens_buffer,
+                *packed_prefill_buffer_list,
             ) = workspace_manager.get_simultaneous(
                 ((chunk_size_const, M, q.shape[-1]), torch.bfloat16),
                 ((max_query_chunk_tokens, combined_topk), torch.int32),
                 ((max_query_chunk_tokens,), torch.int32),
+                *packed_prefill_specs,
             )
+            packed_prefill_buffers = tuple(packed_prefill_buffer_list)
             prefill_state_buffers = None
         for chunk_idx in range(num_chunks):
             write_stats = _sparse_mla_prefill_stats_enabled()
@@ -1519,6 +1787,39 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             chunk_start = chunk_idx * chunk_size_const
             chunk_end = min(chunk_start + chunk_size_const, num_prefills)
             chunk_size = chunk_end - chunk_start
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+            if self._try_forward_flashinfer_packed_prefill(
+                self,
+                q=q,
+                compressed_k_cache=compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                output=output,
+                attn_metadata=attn_metadata,
+                swa_metadata=swa_metadata,
+                topk_indices=topk_indices,
+                top_k=top_k,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                query_start=int(query_start),
+                query_end=int(query_end),
+                combined_indices_buffer=combined_indices_buffer,
+                combined_lens_buffer=combined_lens_buffer,
+                packed_prefill_buffers=packed_prefill_buffers,
+                write_stats=write_stats,
+                stage_timer=stage_timer,
+            ):
+                continue
             if not swa_only:
                 # Gather compressed KV
                 assert attn_metadata is not None
@@ -1558,13 +1859,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 )
 
             # Combine the topk indices and SWA indices for gathered KV cache
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
-
             with (
                 stage_timer.stage("combine_indices")
                 if stage_timer is not None

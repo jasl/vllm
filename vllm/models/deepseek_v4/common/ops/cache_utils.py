@@ -20,6 +20,11 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
 
+def _next_power_of_2(value: int) -> int:
+    value = max(int(value), 1)
+    return 1 << (value - 1).bit_length()
+
+
 @triton.jit
 def quantize_and_insert_k_kernel(
     # Input tensors
@@ -489,7 +494,7 @@ def dequantize_global_slots_k_cache(
         scale_dim=TOKEN_SCALE_DIM,
         quant_block=QUANT_BLOCK_SIZE,
         output_dim=512,
-        BLOCK_D=triton.next_power_of_2(512),
+        BLOCK_D=_next_power_of_2(512),
     )
 
 
@@ -702,7 +707,7 @@ def combine_topk_swa_indices(
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
-        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+        PADDED_TOP_K=_next_power_of_2(topk_indices.shape[-1]),
     )
     return combined_indices, combined_lens
 
@@ -797,6 +802,8 @@ def build_flashinfer_mixed_sparse_indices(
     topk: int,
     decode_compressed_indices_are_local: bool = False,
     decode_is_valid_token: torch.Tensor | None = None,
+    sparse_indices: torch.Tensor | None = None,
+    sparse_topk_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the FlashInfer DSV4 sparse-index matrix for decode-first batches.
 
@@ -857,19 +864,33 @@ def build_flashinfer_mixed_sparse_indices(
     # by ``sparse_topk_lens``, so padding never changes the attention result.
     padded_topk = max(topk, decode_compressed_topk)
     padded_topk = (padded_topk + 3) // 4 * 4
-    sparse_indices = torch.empty(
-        (num_tokens, window_size + padded_topk),
-        dtype=torch.int32,
-        device=decode_swa_indices.device,
-    )
-    sparse_topk_lens = torch.empty(
-        num_tokens, dtype=torch.int32, device=decode_swa_indices.device
-    )
+    if sparse_indices is None:
+        sparse_indices = torch.empty(
+            (num_tokens, window_size + padded_topk),
+            dtype=torch.int32,
+            device=decode_swa_indices.device,
+        )
+    else:
+        assert sparse_indices.dtype == torch.int32
+        assert sparse_indices.device == decode_swa_indices.device
+        assert sparse_indices.shape[0] >= num_tokens
+        assert sparse_indices.shape[1] >= window_size + padded_topk
+        sparse_indices = sparse_indices[:num_tokens]
+        padded_topk = sparse_indices.shape[1] - window_size
+    if sparse_topk_lens is None:
+        sparse_topk_lens = torch.empty(
+            num_tokens, dtype=torch.int32, device=decode_swa_indices.device
+        )
+    else:
+        assert sparse_topk_lens.dtype == torch.int32
+        assert sparse_topk_lens.device == decode_swa_indices.device
+        assert sparse_topk_lens.shape[0] >= num_tokens
+        sparse_topk_lens = sparse_topk_lens[:num_tokens]
     if num_tokens == 0:
         return sparse_indices, sparse_topk_lens
 
-    window_block_size = triton.next_power_of_2(max(window_size, 1))
-    topk_block_size = triton.next_power_of_2(max(padded_topk, 1))
+    window_block_size = _next_power_of_2(max(window_size, 1))
+    topk_block_size = _next_power_of_2(max(padded_topk, 1))
     max_block_size = max(window_block_size, topk_block_size)
     num_warps = 4 if max_block_size >= 256 else 1
 
