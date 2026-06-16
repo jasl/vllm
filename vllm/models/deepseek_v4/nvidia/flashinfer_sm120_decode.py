@@ -336,35 +336,41 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4FlashMLAAttention):
         assert swa_metadata.token_to_req_indices is not None
         assert swa_metadata.block_table is not None
 
-        # --- Prefill SWA window indices. The metadata only materializes the decode
-        # slice, so recompute the per-token SWA kernel over the full token range
-        # (it is keyed by the global token index) and take the prefill tail.
-        # NOTE: moving this into the metadata builder (compute once vs per-layer)
-        # is the obvious optimization but a first attempt hung the warmup
-        # prefill-dummy path; revisit with validated dummy-shape SWA inputs.
-        from vllm.v1.attention.backends.mla.sparse_swa import (
-            _compute_swa_indices_and_lens_kernel,
-        )
+        # --- Prefill SWA window indices. The metadata builder hoists this once per
+        # step (DeepseekSparseSWAMetadataBuilder.build widens its decode-SWA launch
+        # over the prefill tail), so steady-state just reads the precomputed views
+        # and skips ~60 redundant per-layer kernel launches. The builder deliberately
+        # leaves them None on the warmup/profile dummy (its all-(-1) slot_mapping
+        # makes is_valid_token all-False over the prefill tail) and during CUDA-graph
+        # capture; we then self-compute exactly as before, keeping those paths
+        # byte-identical to the validated v1 (the prefill packed kernel is a no-op
+        # over the all-invalid dummy: every token gets swa_len=0).
+        swa_indices = swa_metadata.prefill_swa_indices
+        swa_lens = swa_metadata.prefill_swa_lens
+        if swa_indices is None or swa_lens is None:
+            from vllm.v1.attention.backends.mla.sparse_swa import (
+                _compute_swa_indices_and_lens_kernel,
+            )
 
-        swa_idx_full, swa_len_full = _get_prefill_swa_scratch(
-            num_tokens, self.window_size
-        )
-        _compute_swa_indices_and_lens_kernel[(num_tokens,)](
-            swa_idx_full,
-            swa_idx_full.stride(0),
-            swa_len_full,
-            self.window_size,
-            swa_metadata.query_start_loc,
-            swa_metadata.seq_lens,
-            swa_metadata.token_to_req_indices,
-            swa_metadata.is_valid_token,
-            swa_metadata.block_table,
-            swa_metadata.block_table.stride(0),
-            swa_metadata.block_size,
-            TRITON_BLOCK_SIZE=1024,
-        )
-        swa_indices = swa_idx_full[num_decode_tokens:num_tokens]
-        swa_lens = swa_len_full[num_decode_tokens:num_tokens]
+            swa_idx_full, swa_len_full = _get_prefill_swa_scratch(
+                num_tokens, self.window_size
+            )
+            _compute_swa_indices_and_lens_kernel[(num_tokens,)](
+                swa_idx_full,
+                swa_idx_full.stride(0),
+                swa_len_full,
+                self.window_size,
+                swa_metadata.query_start_loc,
+                swa_metadata.seq_lens,
+                swa_metadata.token_to_req_indices,
+                swa_metadata.is_valid_token,
+                swa_metadata.block_table,
+                swa_metadata.block_table.stride(0),
+                swa_metadata.block_size,
+                TRITON_BLOCK_SIZE=1024,
+            )
+            swa_indices = swa_idx_full[num_decode_tokens:num_tokens]
+            swa_lens = swa_len_full[num_decode_tokens:num_tokens]
 
         # --- Compressed (extra) prefill indices, mirroring the FlashMLA prefill
         # construction but converted to global slots for the packed kernel.
