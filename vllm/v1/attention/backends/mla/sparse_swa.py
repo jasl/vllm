@@ -7,6 +7,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -28,6 +29,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+
+logger = init_logger(__name__)
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -414,6 +417,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             and bool(is_valid_token[num_decode_tokens:num_tokens].any())
         )
         swa_total_tokens = num_tokens if want_prefill_swa else num_decode_tokens
+        if want_prefill_swa:
+            logger.info_once(
+                "DeepSeek V4 SM120: prefill SWA window indices hoisted into the "
+                "metadata builder (once per step, replacing per-layer recompute)."
+            )
         if swa_total_tokens > 0:
             self.decode_swa_lens[swa_total_tokens:] = 0
             _compute_swa_indices_and_lens_kernel[(swa_total_tokens,)](
