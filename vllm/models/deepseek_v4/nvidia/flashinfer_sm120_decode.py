@@ -397,13 +397,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4FlashMLAAttention):
                 )
             topk_indices = topk_indices.contiguous()
 
-        # --- Launch the packed prefill kernel PER REQUEST-CHUNK. Driving the runner
-        # once over a whole multi-request prefill batch produces wrong attention
-        # across request boundaries (GSM8K nc=8 0.913 vs nc=1 0.957); both the
-        # FlashMLA parent (get_prefill_chunk_plan) and the fork (PREFILL_CHUNK_SIZE)
-        # chunk per request. We mirror that: chunk by PREFILL_CHUNK_SIZE requests and
-        # slice the prefill-local query/index/output tensors per chunk. (At C=1 this
-        # is a single chunk, so the C=1 prefill throughput is unchanged.)
+        # --- Launch the packed prefill kernel via the runner. num_tokens > 64
+        # auto-dispatches the prefill kernel; mid_out/mid_lse are decode-only and
+        # only needed for the (rare) <=64-token prefill chunk.
         query = self._prepare_sm120_query(q, output)
         swa_cache = _as_sparse_sm120_cache(swa_k_cache)
         extra_cache = (
@@ -411,52 +407,28 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4FlashMLAAttention):
             if (compressed_k_cache is not None and not swa_only)
             else None
         )
-        assert swa_metadata.query_start_loc_cpu is not None
-        qsl_cpu = swa_metadata.query_start_loc_cpu
-        prefill_token_base = int(qsl_cpu[num_decodes])
-        num_chunks = (
-            num_prefills + self.PREFILL_CHUNK_SIZE - 1
-        ) // self.PREFILL_CHUNK_SIZE
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
-            chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
-            q_start = int(qsl_cpu[num_decodes + chunk_start]) - prefill_token_base
-            q_end = int(qsl_cpu[num_decodes + chunk_end]) - prefill_token_base
-            chunk_tokens = q_end - q_start
-            if chunk_tokens <= 0:
-                continue
-            topk_indices_chunk = (
-                topk_indices[q_start:q_end] if topk_indices is not None else None
+        mid_out = None
+        mid_lse = None
+        if num_prefill_tokens <= _DECODE_MAX_TOKENS:
+            extra_topk = topk_indices.shape[-1] if topk_indices is not None else 0
+            mid_out, mid_lse = _get_decode_scratch(
+                num_prefill_tokens,
+                output.shape[1],
+                output.shape[-1],
+                swa_indices.shape[-1],
+                extra_topk,
             )
-            topk_lens_chunk = (
-                topk_lens[q_start:q_end] if topk_lens is not None else None
-            )
-            mid_out = None
-            mid_lse = None
-            if chunk_tokens <= _DECODE_MAX_TOKENS:
-                extra_topk = (
-                    topk_indices_chunk.shape[-1]
-                    if topk_indices_chunk is not None
-                    else 0
-                )
-                mid_out, mid_lse = _get_decode_scratch(
-                    chunk_tokens,
-                    output.shape[1],
-                    output.shape[-1],
-                    swa_indices.shape[-1],
-                    extra_topk,
-                )
-            self._sm120_runner.run(
-                query[q_start:q_end],
-                swa_cache,
-                swa_indices[q_start:q_end],
-                output[q_start:q_end],
-                self.scale,
-                topk_length=swa_lens[q_start:q_end],
-                attn_sink=self.attn_sink,
-                extra_kv_cache=extra_cache,
-                extra_indices=topk_indices_chunk,
-                extra_topk_length=topk_lens_chunk,
-                mid_out=mid_out,
-                mid_lse=mid_lse,
-            )
+        self._sm120_runner.run(
+            query,
+            swa_cache,
+            swa_indices,
+            output,
+            self.scale,
+            topk_length=swa_lens,
+            attn_sink=self.attn_sink,
+            extra_kv_cache=extra_cache,
+            extra_indices=topk_indices,
+            extra_topk_length=topk_lens,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )
