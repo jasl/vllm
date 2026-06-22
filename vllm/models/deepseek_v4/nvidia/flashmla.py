@@ -1114,6 +1114,25 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 combined_indices=combined_indices_buffer,
                 combined_lens=combined_lens_buffer,
             )
+            # Canary (env-gated, default OFF): the default-path C4A combine can, on a
+            # CPU-upper-bound vs device-seq_lens desync, emit a combined index past the
+            # gathered-KV workspace (chunk_size*chunk_m rows). The accumulate kernel
+            # gathers it with only a >=0 sentinel -> OOB read -> intermittent illegal
+            # access (PR#41834 DerAndereAndi). Raise here so the condition is caught
+            # deterministically instead of as a random async CUDA fault.
+            import os as _os
+
+            if _os.environ.get("VLLM_DEEPSEEK_V4_DEBUG_COMBINE_BOUNDS") == "1":
+                _valid = combined_indices[combined_indices >= 0]
+                if _valid.numel():
+                    _mx = int(_valid.max())
+                    _bound = int(chunk_size) * int(chunk_m)
+                    if _mx >= _bound:
+                        raise AssertionError(
+                            f"[C4A-combine-OOB] max combined index {_mx} >= kv rows "
+                            f"{_bound} (chunk_size={int(chunk_size)} "
+                            f"chunk_m={int(chunk_m)} chunk_n={int(chunk_n)})"
+                        )
             if triton_sparse_mla_enabled:
                 self._forward_sparse_mla_prefill_triton(
                     self,
