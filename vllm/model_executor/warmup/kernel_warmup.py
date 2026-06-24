@@ -55,7 +55,18 @@ _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 8192
 # SM12x gates while still avoiding the scheduler's raw max_num_seqs (often 1024),
 # which can consume multiple GiB of temporary workspace on long-context serves
 # before the first request.
-_DEEPSEEK_V4_MTP_UNIFORM_DECODE_WARMUP_REQUESTS = (1, 2, 4, 8, 16, 24, 32)
+#
+# Batch size 3 is included explicitly: the sparse-MLA decode attention kernels
+# (_build_combined_decode_valid_mask_kernel,
+# _finish_materialized_scores_with_sink_candidate_block_kernel,
+# _indexed_d512_split_{score,stats,value}_kernel,
+# _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel,
+# _finish_two_attention_states_with_sink_kernel,
+# _indexed_d512_chunked_merge_{acc,state}_kernel,
+# _accumulate_indexed_attention_chunk_multihead_kernel) JIT-compile on first use
+# at each distinct batch shape.  Without warming batch=3 the first 3-concurrent
+# request pays a ~20s Triton compilation stall mid-inference (PR #41834).
+_DEEPSEEK_V4_MTP_UNIFORM_DECODE_WARMUP_REQUESTS = (1, 2, 3, 4, 8, 16, 24, 32)
 _DEEPSEEK_V4_MTP_UNIFORM_DECODE_MAX_WARMUP_REQUESTS = 256
 _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     32,

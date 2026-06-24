@@ -21,7 +21,7 @@ def test_deepseek_v4_mtp_uniform_decode_warmup_covers_c256():
         max_reqs=256,
     )
 
-    assert requests == (1, 2, 4, 8, 16, 24, 32, 256)
+    assert requests == (1, 2, 3, 4, 8, 16, 24, 32, 256)
 
 
 def test_deepseek_v4_mtp_uniform_decode_warmup_still_respects_limits():
@@ -29,9 +29,9 @@ def test_deepseek_v4_mtp_uniform_decode_warmup_still_respects_limits():
         _mtp_runner(),
         max_tokens=4096,
         max_reqs=24,
-    ) == (1, 2, 4, 8, 16, 24)
+    ) == (1, 2, 3, 4, 8, 16, 24)
     assert kernel_warmup._deepseek_v4_mtp_uniform_decode_warmup_requests(
         _mtp_runner(),
         max_tokens=96,
         max_reqs=256,
-    ) == (1, 2, 4, 8, 16, 24, 32)
+    ) == (1, 2, 3, 4, 8, 16, 24, 32)
