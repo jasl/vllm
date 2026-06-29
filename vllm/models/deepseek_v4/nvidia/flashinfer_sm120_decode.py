@@ -382,24 +382,13 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
             block_size = attn_metadata.block_size // self.compress_ratio
             if self.compress_ratio == 4:
                 assert self.topk_indices_buffer is not None
+                # The indexer (top_k_per_row_prefill) already emits request-local
+                # compressed top-k positions (rowStart = cu_seqlen_ks is subtracted
+                # inside the kernel), so feed the buffer slice straight to the
+                # global-slot mapping exactly as the validated SM120 DECODE path does
+                # above. The previous cu_base rebase double-subtracted that base and
+                # mis-indexed req>0 at num_prefills>1 (candidate fix for PR#41834).
                 prefill_local = self.topk_indices_buffer[num_decode_tokens:num_tokens]
-                # Rebase the indexer's BATCH-GLOBAL compressed top-k positions
-                # (cu_seqlen_ks = exclusive cumsum of seq_len // compress_ratio; see
-                # indexer.py) to per-request-local so block_table[req] maps them
-                # in-range. Without this, req>0 positions overflow into the wrong
-                # request's physical blocks. No-op at num_prefills==1 (cu_base[0]==0).
-                comp_lens = (
-                    swa_metadata.seq_lens[num_decodes:num_reqs] // self.compress_ratio
-                )
-                cu_base = (torch.cumsum(comp_lens, dim=0) - comp_lens).to(torch.int32)
-                req_local = (
-                    swa_metadata.token_to_req_indices[num_decode_tokens:num_tokens]
-                    - num_decodes
-                ).long()
-                base_per_token = cu_base[req_local].unsqueeze(1)
-                prefill_local = torch.where(
-                    prefill_local >= 0, prefill_local - base_per_token, prefill_local
-                )
                 global_indices, topk_lens = compute_global_topk_indices_and_lens(
                     prefill_local,
                     swa_metadata.token_to_req_indices[num_decode_tokens:num_tokens],
