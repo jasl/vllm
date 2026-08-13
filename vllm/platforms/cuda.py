@@ -673,7 +673,19 @@ class CudaPlatformBase(Platform):
         serves on stock deps. (#43477 enabled family-120 here; re-enable once
         DeepGEMM #324 lands.)
         """
-        return cls.is_device_capability(90) or cls.is_device_capability_family(100)
+        # EXPERIMENT ONLY -- do not ship. family-120 is re-admitted here to
+        # measure whether the DeepGEMM scale-factor assertion still fires now
+        # that the pin moved to deepseek-ai nv_dev tip (8b1392b9), which carries
+        # DeepGEMM's own SM120 kernels (sm120_fp8_fp4_gemm_1d1d.cuh,
+        # sm120_fp4_paged_mqa_logits.cuh, sm120_tf32_hc_prenorm_gemm.cuh).
+        # 2026-06-23 a94657e601 disabled this after measuring the abort against
+        # the OLD pin. The ref changed; the measurement has to be redone rather
+        # than inherited.
+        return (
+            cls.is_device_capability(90)
+            or cls.is_device_capability_family(100)
+            or cls.is_device_capability_family(120)
+        )
 
     @classmethod
     def is_integrated_gpu(cls, device_id: int = 0) -> bool:
