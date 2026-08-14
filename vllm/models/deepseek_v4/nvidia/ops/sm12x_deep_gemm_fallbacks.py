@@ -444,7 +444,11 @@ def _fp8_mqa_logits_sm12x(
     clean_logits: bool,
 ) -> torch.Tensor:
     q_values, q_scale = q
-    if clean_logits and q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+    # The Triton kernel always writes -inf outside [ks, ke) (it cleans
+    # unconditionally), so it satisfies both clean_logits contracts. Routing
+    # clean_logits=False here keeps long prefills off the torch fallback,
+    # which degenerates to head_chunk_size=1 at large seq_len_kv.
+    if q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
         from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import (
             fp8_mqa_logits_triton,
         )
