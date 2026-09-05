@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
+import resource
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -123,6 +125,27 @@ def compute_sub_block_ptrs(
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
 
+def _max_pinnable_mmap_bytes() -> int | None:
+    """Upper bound on how much of an mmap region we should try to pin.
+
+    Uses RLIMIT_MEMLOCK when it is finite. When it is unlimited, fall back
+    to a conservative fraction of physical RAM, because cudaHostRegister can
+    still fail on extremely large tmpfs-backed mmap regions (e.g. >100 GiB)
+    and a failed call may leave the CUDA context in a bad state.
+    """
+    hard_limit = resource.getrlimit(resource.RLIMIT_MEMLOCK)[1]
+    if hard_limit != resource.RLIMIT_INFINITY:
+        return hard_limit
+    try:
+        page_size = os.sysconf(os.sysconf_names["SC_PAGE_SIZE"])
+        num_pages = os.sysconf(os.sysconf_names["SC_PHYS_PAGES"])
+        total_ram = page_size * num_pages
+    except (AttributeError, OSError, ValueError):
+        return None
+    # Do not try to pin more than half of physical RAM.
+    return total_ram // 2
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     if not current_platform.is_cuda_alike():
@@ -130,6 +153,24 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             "Skipping mmap host registration on %s; cudaHostRegister is only "
             "available on CUDA/ROCm.",
             current_platform.device_name,
+        )
+        return
+
+    # Avoid cudaHostRegister when the region is larger than what the process
+    # can pin. On failure, cudaHostRegister can corrupt the CUDA context and
+    # cause later CUDA operations (e.g. warmup) to fail with errors such as
+    # "CUDA error: invalid argument". This is especially common with CPU KV
+    # cache offloading, where the mmap can be 100+ GiB while the default
+    # docker/container memlock limit is only a few MiB.
+    max_pin = _max_pinnable_mmap_bytes()
+    if max_pin is not None and region.total_size_bytes > max_pin:
+        logger.info(
+            "Skipping mmap host registration: region size %.2f GiB exceeds "
+            "the pinnable memory bound %.2f GiB. Transfers will use unpinned "
+            "DMA. Raise the memlock limit (e.g. --ulimit memlock=-1:-1) to "
+            "pin this region.",
+            region.total_size_bytes / (1 << 30),
+            max_pin / (1 << 30),
         )
         return
 
