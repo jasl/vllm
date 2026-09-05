@@ -420,3 +420,19 @@ def test_transfer_multi_group(
 
     handlers.cpu_to_gpu_handler.shutdown()
     handlers.gpu_to_cpu_handler.shutdown()
+
+
+def test_max_pinnable_mmap_bytes():
+    import resource
+
+    from vllm.v1.kv_offload.cpu.gpu_worker import _max_pinnable_mmap_bytes
+
+    # With a finite memlock limit, the bound equals that limit.
+    resource.setrlimit(resource.RLIMIT_MEMLOCK, (1 << 20, 2 << 20))
+    assert _max_pinnable_mmap_bytes() == 2 << 20
+
+    # With an unlimited memlock limit, the bound is a fraction of physical RAM.
+    resource.setrlimit(resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+    bound = _max_pinnable_mmap_bytes()
+    assert bound is not None
+    assert bound > 0
