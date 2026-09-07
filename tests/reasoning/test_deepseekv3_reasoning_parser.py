@@ -4,14 +4,12 @@
 import pytest
 from transformers import AutoTokenizer
 
-from vllm.config.reasoning import ReasoningConfig
+from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.reasoning import ReasoningParserManager
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from vllm.reasoning.deepseek_v3_reasoning_parser import (
     DeepSeekV3ReasoningParser,
-    DeepSeekV3ReasoningWithThinkingParser,
 )
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 
@@ -19,7 +17,6 @@ REASONING_MODEL_NAME = "deepseek-ai/DeepSeek-V3.1"
 
 
 class FakeReasoningTokenizer:
-
     def get_vocab(self) -> dict[str, int]:
         return {"<think>": 100, "</think>": 101}
 

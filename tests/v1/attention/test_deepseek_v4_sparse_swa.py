@@ -28,7 +28,7 @@ def test_sparse_swa_opts_out_of_reorder_batch_vote():
         num_kv_heads=1,
         head_size=512,
         dtype=torch.bfloat16,
-        compress_ratio=4,
+        tokens_per_state=4,
     )
 
     builder = DeepseekSparseSWAMetadataBuilder(

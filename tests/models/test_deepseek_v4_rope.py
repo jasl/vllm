@@ -80,8 +80,16 @@ def test_resolve_layer_compress_ratio(
     assert ratio >= 1
 
 
-def test_unscaled_rope_selects_plain_rotary_embedding(default_vllm_config):
+@pytest.mark.parametrize("nested_parameters", [False, True])
+def test_unscaled_rope_selects_plain_rotary_embedding(
+    default_vllm_config, nested_parameters
+):
     config = _config([1, 4, 4, 1, 0])
+    if nested_parameters:
+        config.rope_parameters = {
+            "main": dict(config.rope_parameters),
+            "compress": dict(config.rope_parameters),
+        }
     rope = build_deepseek_v4_rope(
         config,
         head_dim=64,

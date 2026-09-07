@@ -32,9 +32,7 @@ def test_responses_accepts_every_effort_chat_accepts(effort):
         messages=[{"role": "user", "content": "hi"}],
         reasoning_effort=effort,
     )
-    request = ResponsesRequest(
-        model=MODEL, input="hi", reasoning={"effort": effort}
-    )
+    request = ResponsesRequest(model=MODEL, input="hi", reasoning={"effort": effort})
     assert request.reasoning is not None
     assert request.reasoning.effort == effort
 

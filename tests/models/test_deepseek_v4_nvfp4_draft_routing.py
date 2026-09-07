@@ -18,16 +18,19 @@ def _config_with(num_hidden_layers: int | None) -> DeepseekV4FP8Config:
 
 def test_main_stack_prefixes_are_not_draft():
     cfg = _config_with(43)
-    for prefix in ("layers.0.ffn.experts", "layers.42.ffn.experts",
-                   "model.layers.42.ffn.experts"):
+    for prefix in (
+        "layers.0.ffn.experts",
+        "layers.42.ffn.experts",
+        "model.layers.42.ffn.experts",
+    ):
         assert not cfg._is_draft_module_prefix(prefix), prefix
 
 
 def test_draft_module_prefixes_detected_for_all_backends():
     cfg = _config_with(43)
     for prefix in (
-        "layers.43.ffn.experts",        # NVIDIA DSpark, empty root
-        "layers.45.ffn.experts",        # third DSpark block
+        "layers.43.ffn.experts",  # NVIDIA DSpark, empty root
+        "layers.45.ffn.experts",  # third DSpark block
         "model.layers.43.ffn.experts",  # NVIDIA MTP root
     ):
         assert cfg._is_draft_module_prefix(prefix), prefix

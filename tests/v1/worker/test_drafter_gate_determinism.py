@@ -24,9 +24,7 @@ def _method_ast(name: str) -> ast.AST:
 
 
 def _attribute_names(tree: ast.AST) -> set[str]:
-    return {
-        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
-    }
+    return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
 
 
 def test_gate_reads_only_rank_identical_state():

@@ -96,9 +96,7 @@ def test_sample_from_logits_does_not_prerepeat_temperature(monkeypatch):
         captured["temperature_rows"] = sampling_metadata.temperature.shape[0]
         return logits_arg.argmax(dim=-1), logits_arg
 
-    monkeypatch.setattr(
-        llm_base_proposer, "compute_probs_and_sample_next_token", _spy
-    )
+    monkeypatch.setattr(llm_base_proposer, "compute_probs_and_sample_next_token", _spy)
 
     class _Stub:
         _enable_probabilistic_draft_probs = True
@@ -128,9 +126,7 @@ def test_parallel_draft_seeded_generators_are_deterministic_per_request():
             r: torch.Generator(device=DEVICE_TYPE).manual_seed(31 + r)
             for r in range(batch_size)
         }
-        return dataclasses.replace(
-            _make_sampling_metadata(batch_size), generators=gens
-        )
+        return dataclasses.replace(_make_sampling_metadata(batch_size), generators=gens)
 
     out1, _ = compute_probs_and_sample_next_token(
         logits.clone(), _seeded_metadata(), use_fp64_gumbel=False
@@ -140,6 +136,7 @@ def test_parallel_draft_seeded_generators_are_deterministic_per_request():
     )
     assert out1.shape[0] == batch_size * k
     assert torch.equal(out1, out2)
+
 
 @pytest.mark.parametrize(
     ("architecture", "expected"),

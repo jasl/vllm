@@ -114,7 +114,7 @@ def test_deepseek_v4_fused_moe_init_exports_moe_metadata(monkeypatch):
 
     monkeypatch.setattr(deepseek_v4_model, "GateLinear", FakeGate)
     monkeypatch.setattr(deepseek_v4_model, "DeepseekV4MLP", FakeMLP)
-    monkeypatch.setattr(deepseek_v4_model, "FusedMoE", FakeFusedMoE)
+    monkeypatch.setattr(deepseek_v4_model, "FusedMoEFactory", FakeFusedMoE)
     monkeypatch.setattr(
         deepseek_v4_model,
         "get_tensor_model_parallel_world_size",
@@ -136,11 +136,13 @@ def test_deepseek_v4_fused_moe_init_exports_moe_metadata(monkeypatch):
         hidden_act="silu",
         norm_topk_prob=True,
         num_hash_layers=0,
+        num_hidden_layers=32,
         vocab_size=128000,
     )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=config),
         quant_config=None,
+        speculative_config=None,
         kernel_config=SimpleNamespace(moe_backend="auto"),
         parallel_config=SimpleNamespace(
             enable_expert_parallel=True,

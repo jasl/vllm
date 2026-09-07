@@ -9,6 +9,7 @@ defaults ON, this gate is what keeps the default FlashMLA/Triton path from
 launching that kernel (which faults). It must be True ONLY when all three of
 {DECODE opted in, SM12x device, FI SM120 kernel present} hold.
 """
+
 from unittest.mock import patch
 
 import pytest
@@ -50,9 +51,9 @@ def test_all_three_true_is_active(monkeypatch):
 @pytest.mark.parametrize(
     "decode,family120,kernel",
     [
-        (False, True, True),   # SM120 FI decode backend not opted in (the default)
-        (True, False, True),   # not SM12x (e.g. Hopper)
-        (True, True, False),   # FI SM120 kernel absent (flashinfer < 0.6.13)
+        (False, True, True),  # SM120 FI decode backend not opted in (the default)
+        (True, False, True),  # not SM12x (e.g. Hopper)
+        (True, True, False),  # FI SM120 kernel absent (flashinfer < 0.6.13)
         (False, False, False),
     ],
 )

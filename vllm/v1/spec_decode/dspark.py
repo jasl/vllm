@@ -139,7 +139,9 @@ class _DSparkForwardCUDAGraph:
             main_positions,
             main_x,
         )
-        input_ptrs = self._make_ptrs(input_ids, positions, hidden_states, main_positions)
+        input_ptrs = self._make_ptrs(
+            input_ids, positions, hidden_states, main_positions
+        )
         if input_key is None or input_ptrs is None:
             return self.model(
                 input_ids=input_ids,
@@ -309,8 +311,7 @@ class DSparkProposer(DFlashProposer):
         target_embed_tokens = getattr(target_inner_model, "embed_tokens", None)
         if target_embed_tokens is None or not hasattr(self.model, "embed_tokens"):
             logger.warning(
-                "DSpark could not share target embeddings; keeping draft "
-                "embed_tokens."
+                "DSpark could not share target embeddings; keeping draft embed_tokens."
             )
             return
 
@@ -322,17 +323,14 @@ class DSparkProposer(DFlashProposer):
     def _maybe_share_lm_head(self, target_language_model: Any) -> None:
         if get_pp_group().world_size != 1:
             logger.info(
-                "DSpark draft model keeps separate lm_head under pipeline "
-                "parallelism."
+                "DSpark draft model keeps separate lm_head under pipeline parallelism."
             )
             return
 
         if not hasattr(target_language_model, "lm_head") or not hasattr(
             self.model, "head"
         ):
-            logger.warning(
-                "DSpark could not share target lm_head; keeping draft head."
-            )
+            logger.warning("DSpark could not share target lm_head; keeping draft head.")
             return
 
         del self.model.head
@@ -400,9 +398,7 @@ class DSparkProposer(DFlashProposer):
             device=self.device,
             dtype=self.positions.dtype,
         )
-        self.positions[:num_tokens].view(
-            batch_size, self.num_speculative_tokens
-        ).copy_(
+        self.positions[:num_tokens].view(batch_size, self.num_speculative_tokens).copy_(
             self._dspark_main_positions.to(self.positions.dtype).unsqueeze(1)
             + draft_offsets.unsqueeze(0)
         )

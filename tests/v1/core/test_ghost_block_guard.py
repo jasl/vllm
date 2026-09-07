@@ -40,7 +40,9 @@ BLOCK_SIZE = 16
 
 
 def _pool():
-    return BlockPool(num_gpu_blocks=100, enable_caching=True, hash_block_size=BLOCK_SIZE)
+    return BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=BLOCK_SIZE
+    )
 
 
 def _full_manager(block_pool):
@@ -96,7 +98,7 @@ def test_unset_env_resolves_to_the_engine_supplied_default():
         "a directly-constructed manager must stay off"
     )
 
-    manager._guard_default_mode = 2      # what the coordinator does
+    manager._guard_default_mode = 2  # what the coordinator does
     assert manager._ghost_block_guard_enabled is True
 
 
@@ -245,6 +247,7 @@ def _dspark_config():
 
     cfg = MagicMock()
     cfg.speculative_config.method = "dspark"
+    cfg._get_v2_model_runner_unsupported_features.return_value = []
     cfg.parallel_config.prefill_context_parallel_size = 1
     return cfg
 
@@ -262,9 +265,7 @@ def test_dspark_defaults_to_v2_and_can_be_forced_back_to_v1(monkeypatch):
     prop = VllmConfig.use_v2_model_runner.fget
     cfg = _dspark_config()
 
-    monkeypatch.setattr(
-        "vllm.envs.VLLM_USE_V2_MODEL_RUNNER", None, raising=False
-    )
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", None, raising=False)
     assert prop(cfg) is True, "DSpark must route to V2 by default"
 
     monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", False, raising=False)

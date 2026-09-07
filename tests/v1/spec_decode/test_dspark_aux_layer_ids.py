@@ -18,10 +18,12 @@ def _stub_runner(hf_config) -> SimpleNamespace:
         )
     )
 
+
 def test_dspark_target_layer_ids_are_shifted_to_capture_semantics():
     hf_config = SimpleNamespace(dspark_target_layer_ids=(40, 41, 42))
     runner = _stub_runner(hf_config)
     assert GPUModelRunner._get_eagle3_aux_layers_from_config(runner) == (41, 42, 43)
+
 
 def test_eagle_aux_ids_pass_through_unshifted():
     hf_config = SimpleNamespace(eagle_aux_hidden_state_layer_ids=(10, 20))

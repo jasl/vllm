@@ -1212,10 +1212,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # this class is flat.
         if self.confidence_head is not None and not loaded_confidence_head:
             self.confidence_head = None
-        self.finalize_mega_moe_weights()
+        self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
     def finalize_mega_moe_weights(self) -> None:
         for layer in self.layers.values():
             layer.finalize_mega_moe_weights()
+
+    def process_weights_after_loading(self) -> None:
+        self.finalize_mega_moe_weights()

@@ -32,9 +32,9 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         top_k: int,
         num_experts: int,
         hidden_size: int,
+        x_bytes_per_token: int,
+        x_sf_bytes_per_token: int,
         num_dispatchers: int = 1,
-        dispatch_dtype_bytes_per_elem: int = 0,
-        dispatch_scale_bytes_per_token: int = 0,
     ):
         super().__init__()
         self.max_num_tokens = max_num_tokens
@@ -42,7 +42,6 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.num_dispatchers_ = num_dispatchers
-        self.scale_elems_per_token = dispatch_scale_bytes_per_token
 
         device_communicator = get_ep_group().device_communicator
         assert device_communicator is not None
@@ -54,8 +53,8 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             top_k=self.top_k,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
-            dispatch_dtype_bytes_per_elem=dispatch_dtype_bytes_per_elem,
-            dispatch_scale_bytes_per_token=dispatch_scale_bytes_per_token,
+            x_bytes_per_token=x_bytes_per_token,
+            x_sf_bytes_per_token=x_sf_bytes_per_token,
         )
 
     @property
@@ -100,9 +99,9 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         )
 
         if defer_input_quant:
-            a1q, a1q_scale = a1, None
+            dispatch_x, dispatch_x_sf = a1, None
         else:
-            a1q, a1q_scale = moe_kernel_quantize_input(
+            dispatch_x, dispatch_x_sf = moe_kernel_quantize_input(
                 a1,
                 quant_config.a1_gscale,
                 quant_config.quant_dtype,
@@ -112,10 +111,9 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
                 mx_alignment=quant_config.mx_alignment,
             )
 
-        payloads = []
-        payloads.append(a1q)
-        if a1q_scale is not None:
-            payloads.append(a1q_scale)
+        payloads = [dispatch_x]
+        if dispatch_x_sf is not None:
+            payloads.append(dispatch_x_sf)
         topk_ids_payload_index = len(payloads)
         payloads.append(topk_ids)
         payloads.append(topk_weights)
@@ -128,25 +126,30 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
             expert_id_payload_index=topk_ids_payload_index,
         )
-        if a1q_scale is not None:
-            a1q_recv, a1q_scale_recv, topk_ids_recv, topk_weights_recv = recv_payloads
-            # Swizzle after the A2A if the MoE kernel expects swizzled scales.
-            a1q_scale_recv = restore_dispatched_scale_layout(
-                a1q_scale_recv.view(-1, a1q_scale_recv.shape[-1]),
+        if dispatch_x_sf is not None:
+            recv_x, recv_x_sf, topk_ids_recv, topk_weights_recv = recv_payloads
+            x_sf_width = recv_x_sf.shape[-1]
+            recv_x_sf = restore_dispatched_scale_layout(
+                recv_x_sf.view(-1, x_sf_width),
                 quant_config.quant_dtype,
                 quant_config.is_scale_swizzled,
             )
-            assert a1q_scale_recv is not None
-            assert self.scale_elems_per_token > 0
-            a1q_scale_recv = a1q_scale_recv.view(-1, self.scale_elems_per_token)
+            assert recv_x_sf is not None
+            recv_x_sf = recv_x_sf.view(-1, x_sf_width)
         else:
-            a1q_recv, topk_ids_recv, topk_weights_recv = recv_payloads
-            a1q_scale_recv = None
-        a1q_recv = a1q_recv.view(-1, a1q_recv.shape[-1])
+            recv_x, topk_ids_recv, topk_weights_recv = recv_payloads
+            recv_x_sf = None
+        recv_x = recv_x.view(-1, recv_x.shape[-1])
         topk_ids_recv = topk_ids_recv.view(-1, topk_ids_recv.shape[-1])
         topk_weights_recv = topk_weights_recv.view(-1, topk_weights_recv.shape[-1])
 
-        return a1q_recv, a1q_scale_recv, None, topk_ids_recv, topk_weights_recv
+        return (
+            recv_x,
+            recv_x_sf,
+            None,
+            topk_ids_recv,
+            topk_weights_recv,
+        )
 
     def finalize(
         self,

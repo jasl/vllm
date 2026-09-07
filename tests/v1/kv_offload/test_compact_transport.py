@@ -97,10 +97,18 @@ def _packed_kv_cache_config() -> KVCacheConfig:
         num_blocks=8,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=8 * 160, shared_by=["a0", "b0"], offset=0, block_stride=160
+                size=8 * 160,
+                layer_stride=0,
+                layers=["a0", "b0"],
+                offset=0,
+                block_stride=160,
             ),
             KVCacheTensor(
-                size=8 * 160, shared_by=["a1", "b1"], offset=100, block_stride=160
+                size=8 * 160,
+                layer_stride=0,
+                layers=["a1", "b1"],
+                offset=100,
+                block_stride=160,
             ),
         ],
         kv_cache_groups=[
@@ -134,6 +142,10 @@ def _make_vllm_config(
     config.cache_config.prefix_match_unit = None
     config.cache_config.cache_dtype = torch.float16
     config.cache_config.num_gpu_blocks_override = None
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    config.cache_config.get_resolved_kv_cache_layout.return_value = KVCacheLayout.LBNHC
+    config.cache_config.kv_cache_layout = "LBNHC"
     config.model_config.model = "test-model"
     config.model_config.original_max_model_len = -1
     config.model_config.max_model_len = 10000
@@ -248,10 +260,18 @@ def test_heterogeneous_charges_match_layer_specs() -> None:
         num_blocks=4,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=4 * 160, shared_by=["a0", "b0"], offset=0, block_stride=160
+                size=4 * 160,
+                layer_stride=0,
+                layers=["a0", "b0"],
+                offset=0,
+                block_stride=160,
             ),
             KVCacheTensor(
-                size=4 * 160, shared_by=["a1", "b1"], offset=100, block_stride=160
+                size=4 * 160,
+                layer_stride=0,
+                layers=["a1", "b1"],
+                offset=100,
+                block_stride=160,
             ),
         ],
         kv_cache_groups=[
@@ -481,10 +501,18 @@ def test_blocks_per_chunk_gt_one_charge_unchanged() -> None:
         num_blocks=8,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=8 * 160, shared_by=["a0", "b0"], offset=0, block_stride=160
+                size=8 * 160,
+                layer_stride=0,
+                layers=["a0", "b0"],
+                offset=0,
+                block_stride=160,
             ),
             KVCacheTensor(
-                size=8 * 160, shared_by=["a1", "b1"], offset=100, block_stride=160
+                size=8 * 160,
+                layer_stride=0,
+                layers=["a1", "b1"],
+                offset=100,
+                block_stride=160,
             ),
         ],
         kv_cache_groups=[
@@ -778,7 +806,8 @@ def test_scheduler_collapsed_mixed_geometry_no_slice() -> None:
         kv_cache_tensors=[
             KVCacheTensor(
                 size=4 * slot_padded_rounded,
-                shared_by=["c4", "c128"],
+                layer_stride=0,
+                layers=["c4", "c128"],
                 offset=0,
                 block_stride=slot_padded_rounded,
             ),
@@ -840,7 +869,9 @@ def test_missing_keyed_membership_fails_loud_in_group_charges() -> None:
     config = KVCacheConfig(
         num_blocks=4,
         kv_cache_tensors=[
-            KVCacheTensor(size=4 * 160, shared_by=["a0"], offset=0, block_stride=160),
+            KVCacheTensor(
+                size=4 * 160, layer_stride=0, layers=["a0"], offset=0, block_stride=160
+            ),
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -872,7 +903,11 @@ def test_missing_keyed_membership_fails_loud_in_layout_accounting() -> None:
         num_blocks=4,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=4 * 160, shared_by=["a0", "a1"], offset=0, block_stride=160
+                size=4 * 160,
+                layer_stride=0,
+                layers=["a0", "a1"],
+                offset=0,
+                block_stride=160,
             ),
         ],
         kv_cache_groups=[
@@ -912,7 +947,9 @@ def test_misaligned_layer_key_raises_in_group_charges() -> None:
     config = KVCacheConfig(
         num_blocks=4,
         kv_cache_tensors=[
-            KVCacheTensor(size=4 * 160, shared_by=["a0"], offset=0, block_stride=160),
+            KVCacheTensor(
+                size=4 * 160, layer_stride=0, layers=["a0"], offset=0, block_stride=160
+            ),
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(
