@@ -942,9 +942,10 @@ static void launchFullCacheKernel(
 // ────────────────────────────────────────────────────────────────────────────
 // Torch op wrapper
 // ────────────────────────────────────────────────────────────────────────────
-torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
     torch::stable::Tensor const& q_in,           // [N, num_heads_q, 512] bf16
     torch::stable::Tensor const& kv,             // [N, 512] bf16 (read-only)
+    torch::stable::Tensor& q_out,                // reusable padded Q output
     torch::stable::Tensor& k_cache,              // [num_blocks, block_bytes] uint8
     torch::stable::Tensor const& slot_mapping,   // [N] int64
     torch::stable::Tensor const& position_ids,   // [N] int64
@@ -972,6 +973,11 @@ torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                   "q_in and kv dtype must match");
   STD_TORCH_CHECK(q_head_padded >= q_in.size(1),
                   "q_head_padded must be >= q_in.size(1) (num_heads_q)");
+  STD_TORCH_CHECK(q_out.device() == q_in.device() && q_out.is_contiguous() &&
+                      q_out.scalar_type() == q_in.scalar_type() &&
+                      q_out.dim() == 3 && q_out.size(0) == q_in.size(0) &&
+                      q_out.size(1) == q_head_padded && q_out.size(2) == 512,
+                  "q_out must match the padded Q shape, dtype and device");
   STD_TORCH_CHECK(k_cache.scalar_type() == torch::headeronly::ScalarType::Byte,
                   "k_cache must be uint8");
   STD_TORCH_CHECK(cos_sin_cache.dim() == 2 && cos_sin_cache.size(1) == 64,
@@ -999,11 +1005,6 @@ torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
       q_in.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream(q_in.get_device_index());
 
-  // Allocate the padded q output.  The kernel writes every element (live
-  // region gets RMSNorm+RoPE; pad region gets zeros), so `empty` is safe.
-  auto q_out = torch::stable::new_empty(
-      q_in, {q_in.size(0), q_head_padded, q_in.size(2)}, q_in.scalar_type());
-
   VLLM_STABLE_DISPATCH_HALF_TYPES(
       q_in.scalar_type(), "fused_deepseek_v4_qnorm_rope_kv_insert", [&] {
         using qkv_scalar_t = scalar_t;
@@ -1020,6 +1021,21 @@ torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 num_heads_q_padded, cache_block_size_i, kv_block_stride,
                 stream);
       });
+}
+
+torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
+    torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor const& position_ids,
+    torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
+    double eps, int64_t cache_block_size) {
+  STD_TORCH_CHECK(q_in.dim() == 3, "q_in shape [N, num_heads_q, 512]");
+  // The kernel fills both live and padding heads, so empty is safe.
+  auto q_out = torch::stable::new_empty(
+      q_in, {q_in.size(0), q_head_padded, q_in.size(2)}, q_in.scalar_type());
+  fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+      q_in, kv, q_out, k_cache, slot_mapping, position_ids, cos_sin_cache,
+      q_head_padded, eps, cache_block_size);
   return q_out;
 }
 

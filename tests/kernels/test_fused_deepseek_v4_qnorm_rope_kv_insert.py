@@ -145,9 +145,13 @@ def _full_cache_bf16_op_available() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not _op_available(),
-    reason="CUDA not available or fused DeepseekV4 op not built in",
+    not torch.cuda.is_available(),
+    reason="CUDA not available",
 )
+
+
+def test_quant_insert_out_binding_is_registered():
+    assert _op_available(), "DeepSeek V4 requires the caller-owned Q output binding"
 
 
 def _call_fused(
@@ -346,7 +350,8 @@ def test_quant_insert_writes_caller_owned_q_out():
     assert q_out[:, n_heads:padded_heads].abs().max().item() == 0.0
 
 
-def test_quant_insert_allows_inplace_q_when_unpadded():
+@pytest.mark.parametrize("inplace", [False, True])
+def test_quant_insert_out_matches_allocating_op(inplace: bool):
     torch.manual_seed(5)
     device = "cuda"
     dtype = torch.bfloat16
@@ -360,26 +365,27 @@ def test_quant_insert_allows_inplace_q_when_unpadded():
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
     k_cache = torch.zeros(2, block_size * HEAD_BYTES, dtype=torch.uint8, device=device)
-    slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
 
-    q_out = _call_fused(
+    q_out = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q,
-        n_heads,
         kv,
         k_cache,
         slot_mapping,
         positions,
         cos_sin_cache,
+        n_heads,
         eps,
         block_size,
     )
 
-    q_inplace = q.clone()
+    q_inplace = q.clone() if inplace else torch.empty_like(q)
+    out_cache = torch.zeros_like(k_cache)
     returned = _call_fused_out(
-        q_inplace,
+        q_inplace if inplace else q,
         q_inplace,
         kv,
-        torch.zeros_like(k_cache),
+        out_cache,
         slot_mapping,
         positions,
         cos_sin_cache,
@@ -389,6 +395,7 @@ def test_quant_insert_allows_inplace_q_when_unpadded():
 
     assert returned.data_ptr() == q_inplace.data_ptr()
     torch.testing.assert_close(q_inplace, q_out, rtol=0, atol=0)
+    torch.testing.assert_close(out_cache, k_cache, rtol=0, atol=0)
 
 
 # ── Test 2: KV path round-trip byte/value parity ─────────────────────────────
