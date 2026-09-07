@@ -24,7 +24,6 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
-    _attention_backend_name,
     _clamp_warmup_tokens,
     _has_deepseek_v4_sparse_mla_backend,
 )
@@ -63,7 +62,6 @@ _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     256,
     512,
 )
-
 
 
 def _is_deepseek_v4_mtp_spec_decode(runner: "GPUModelRunner") -> bool:
@@ -740,8 +738,7 @@ def _deepseek_v4_paged_mqa_rowwise_decode_warmup(runner: "GPUModelRunner") -> No
     # Only SM12x routes paged-MQA logits onto the Triton fallback
     # (vllm/utils/deep_gemm.py: fp8_fp4_paged_mqa_logits).
     if not (
-        current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
+        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
     ):
         return
 
@@ -986,5 +983,3 @@ _LL_BF16_WARMUP_MODEL_SHAPES: tuple[tuple[int, int], ...] = (
     (14400, 256),  # DSV4-Flash
 )
 _LL_BF16_WARMUP_M_RANGE = range(1, 17)
-
-

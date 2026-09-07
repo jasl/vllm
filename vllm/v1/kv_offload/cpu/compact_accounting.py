@@ -123,9 +123,11 @@ def _packed_slots(
 
     by_offset: dict[int, set[str]] = {}
     for tensor in tensors:
-        if tensor.offset < 0 or tensor.offset >= stride:
-            raise ValueError("packed tensor offset is outside its block stride")
-        by_offset.setdefault(tensor.offset, set()).update(tensor.shared_by)
+        for layer_index, layer in enumerate(tensor.layers):
+            offset = tensor.offset + layer_index * tensor.layer_stride
+            if offset < 0 or offset >= stride:
+                raise ValueError("packed tensor offset is outside its block stride")
+            by_offset.setdefault(offset, set()).add(layer)
 
     offsets = sorted(by_offset)
     slots = []

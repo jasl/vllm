@@ -63,10 +63,18 @@ def _packed_fixture() -> KVCacheConfig:
         num_blocks=8,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=8 * 160, shared_by=["a0", "b0"], offset=0, block_stride=160
+                size=8 * 160,
+                layer_stride=0,
+                layers=["a0", "b0"],
+                offset=0,
+                block_stride=160,
             ),
             KVCacheTensor(
-                size=8 * 160, shared_by=["a1", "b1"], offset=100, block_stride=160
+                size=8 * 160,
+                layer_stride=0,
+                layers=["a1", "b1"],
+                offset=100,
+                block_stride=160,
             ),
         ],
         kv_cache_groups=[
@@ -162,6 +170,21 @@ def test_compact_group_charge_no_prefer_early_eviction() -> None:
 # -----------------------------------------------------------------------
 # build_compact_group_charges
 # -----------------------------------------------------------------------
+
+
+def test_accounting_expands_layer_strides_and_preserves_group_aliasing() -> None:
+    config = _packed_fixture()
+    expected = build_compact_layout_accounting(
+        config, world_size=2, block_size_factor=1, cpu_budget_bytes=5_600
+    )
+    config.kv_cache_tensors = [
+        KVCacheTensor(size=8 * 160, layers=layers, layer_stride=100, block_stride=160)
+        for layers in (["a0", "a1"], ["b0", "b1"])
+    ]
+    actual = build_compact_layout_accounting(
+        config, world_size=2, block_size_factor=1, cpu_budget_bytes=5_600
+    )
+    assert actual == expected
 
 
 def test_build_group_charges_basic() -> None:
@@ -270,7 +293,7 @@ def test_accounting_fails_closed() -> None:
         )
 
     ambiguous = _packed_fixture()
-    ambiguous.kv_cache_tensors[0].shared_by.append("a1")
+    ambiguous.kv_cache_tensors[0].layers.append("a1")
     with pytest.raises(ValueError, match="appears in multiple packed slots"):
         build_compact_layout_accounting(
             ambiguous, world_size=2, block_size_factor=1, cpu_budget_bytes=5_600
@@ -316,10 +339,18 @@ def test_accounting_slice_order_matches_layer_names() -> None:
         num_blocks=4,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=4 * 160, shared_by=["x0", "y0"], offset=0, block_stride=160
+                size=4 * 160,
+                layer_stride=0,
+                layers=["x0", "y0"],
+                offset=0,
+                block_stride=160,
             ),
             KVCacheTensor(
-                size=4 * 160, shared_by=["x1", "y1"], offset=100, block_stride=160
+                size=4 * 160,
+                layer_stride=0,
+                layers=["x1", "y1"],
+                offset=100,
+                block_stride=160,
             ),
         ],
         kv_cache_groups=[
@@ -355,7 +386,9 @@ def test_accounting_no_packed_slot_raises() -> None:
     config = KVCacheConfig(
         num_blocks=2,
         kv_cache_tensors=[
-            KVCacheTensor(size=200, shared_by=["real"], offset=0, block_stride=100)
+            KVCacheTensor(
+                size=200, layer_stride=0, layers=["real"], offset=0, block_stride=100
+            )
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -383,7 +416,9 @@ def test_accounting_duplicate_layer_raises() -> None:
     config = KVCacheConfig(
         num_blocks=2,
         kv_cache_tensors=[
-            KVCacheTensor(size=200, shared_by=["dup"], offset=0, block_stride=100)
+            KVCacheTensor(
+                size=200, layer_stride=0, layers=["dup"], offset=0, block_stride=100
+            )
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(

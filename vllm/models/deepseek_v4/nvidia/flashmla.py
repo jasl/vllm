@@ -238,7 +238,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
 
         combined_topk = sparse_prefill_combined_topk_size(
             cls._prefill_workspace_topk_bound(layer),
-            window_size,
+            window_size + getattr(layer, "max_image_tokens", 0),
         )
         specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((layer.PREFILL_CHUNK_SIZE, m_bound, head_dim), torch.bfloat16),
@@ -811,9 +811,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     attn_metadata.block_table[:num_decodes],
                     block_size,
                     is_valid,
-                    output_buffers=self._global_topk_output_buffers(
-                        self.topk_indices_buffer[:num_decode_tokens]
-                    ),
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
@@ -999,7 +996,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             max_query_chunk_tokens = max(
                 max_query_chunk_tokens, int(query_end - query_start)
             )
-        combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
+        combined_topk = sparse_prefill_combined_topk_size(
+            top_k, self.window_size + self.max_image_tokens
+        )
 
         workspace_manager = current_workspace_manager()
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
@@ -1146,6 +1145,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 chunk_m,
                 chunk_n,
                 out=(combined_indices_buffer, combined_lens_buffer),
+                left_visible=(
+                    swa_metadata.prefill_left_visible[
+                        num_decode_tokens + query_start : num_decode_tokens + query_end
+                    ]
+                    if swa_metadata.prefill_left_visible is not None
+                    else None
+                ),
+                right_visible=(
+                    swa_metadata.prefill_right_visible[
+                        num_decode_tokens + query_start : num_decode_tokens + query_end
+                    ]
+                    if swa_metadata.prefill_right_visible is not None
+                    else None
+                ),
+                max_image_tokens=self.max_image_tokens,
             )
             if triton_sparse_mla_enabled:
                 self._forward_sparse_mla_prefill_triton(

@@ -92,15 +92,6 @@ class DSparkSpeculator(DFlashSpeculator):
         target_model: torch.nn.Module,
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
-        # Take upstream's body whole. The merge-base ALSO had the d2t scatter
-        # assignment; our line lost it in an earlier merge while keeping the
-        # reader at _apply_d2t_scatter, so `self._d2t_scatter_index` was
-        # declared, read, and never assigned -- the branch was dead rather than
-        # broken, which is why nothing failed. Restoring it also brings
-        # upstream #47808's confidence-head requirement for adaptive
-        # verification. Every symbol it needs exists here: draft_logits,
-        # draft_id_to_target_id, enable_adaptive_verification (speculative.py
-        # :248, set at __init__), and confidence_head (our dspark.py).
         model = load_dspark_model(target_model, self.vllm_config)
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
@@ -118,11 +109,7 @@ class DSparkSpeculator(DFlashSpeculator):
                 dtype=self.draft_logits.dtype,
                 device=self.device,
             )
-        # Upstream writes `model.model.confidence_head`, which assumes the draft
-        # model nests its layers under `.model` (qwen3_dspark, gemma4_dspark).
-        # This fork FLATTENED the DeepSeek-V4 DSpark class, so it holds the head
-        # directly and `model.model` raises AttributeError from nn.Module's
-        # __getattr__. Accept both shapes.
+        # DeepSeek V4 uses a flat draft; other DSpark models nest under .model.
         draft_inner = getattr(model, "model", model)
         if self.enable_adaptive_verification and draft_inner.confidence_head is None:
             raise ValueError(
@@ -151,8 +138,8 @@ class DSparkSpeculator(DFlashSpeculator):
             buf.index_copy_(1, self._d2t_scatter_index, logits.to(buf.dtype))
             logits = buf
 
-        # sample_pos is the predicted token's position Q; the target verifies
-        # it with the predecessor's Gumbel key (Q-1). Pass Q-1.
+        # sample_pos is the predicted token's position P. Sampling keys a draw
+        # by the position before the sampled token, P-1.
         return gumbel_sample(
             logits,
             idx_map,
@@ -160,6 +147,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.seeds,
             sample_pos - 1,
             apply_temperature=True,
+            is_drafting=True,
             logits_cache=self.draft_logits,
             logits_cache_col=self._step_cols[step],
             use_fp64=self.use_fp64_gumbel,
@@ -175,7 +163,7 @@ class DSparkSpeculator(DFlashSpeculator):
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
-        base_logits = self.model.compute_logits(sample_hidden)
+        base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 

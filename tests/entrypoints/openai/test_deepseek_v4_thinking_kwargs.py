@@ -75,9 +75,7 @@ def test_both_keys_are_set_not_just_one():
 @pytest.mark.parametrize("key", ["thinking", "enable_thinking"])
 @pytest.mark.parametrize("value", [True, False])
 def test_an_explicit_kwarg_is_never_overridden(key, value):
-    out = apply_deepseek_v4_chat_kwargs(
-        {key: value}, model_name=V4, model_config=None
-    )
+    out = apply_deepseek_v4_chat_kwargs({key: value}, model_name=V4, model_config=None)
     assert out[key] is value
     # The untouched sibling must not be invented, or an explicit False would be
     # silently re-enabled by the other key.
@@ -143,9 +141,7 @@ def test_both_endpoints_honour_an_explicit_off(model_name):
 def test_responses_effort_none_still_disables_thinking():
     """`reasoning.effort: "none"` is folded into enable_thinking upstream of us;
     normalisation must not resurrect thinking afterwards."""
-    request = ResponsesRequest(
-        model=V4, input="hi", reasoning={"effort": "none"}
-    )
+    request = ResponsesRequest(model=V4, input="hi", reasoning={"effort": "none"})
     params = request.build_chat_params(None, "string")
     assert params.chat_template_kwargs.get("enable_thinking") is False
 

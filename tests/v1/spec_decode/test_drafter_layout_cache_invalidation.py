@@ -72,12 +72,14 @@ def test_proposer_loop_entry_invalidates_the_mapping_cache():
             for t in node.targets:
                 if (
                     isinstance(t, ast.Attribute)
-                    and t.attr in (
+                    and t.attr
+                    in (
                         "_token_to_req_indices_cache",
                         "_num_computed_tokens_cache",
                     )
                     and isinstance(t.value, ast.Attribute)
-                    and t.value.attr == "common_attn_metadata"
+                    and t.value.attr
+                    == "common_attn_metadata"
                     == False  # value is Name for local var; handle both
                 ):
                     pass

@@ -17,21 +17,34 @@ def build_deepseek_v4_rope(
     compress_ratio: int,
     use_unscaled_rope: bool = False,
 ) -> RotaryEmbedding:
-    # Copy so per-layer overrides cannot leak into the shared hf_config dict.
-    rope_parameters = dict(config.rope_parameters)
+    rope_parameters = config.rope_parameters
+    # Newer checkpoints nest per-layer-type rope dicts ({"main", "compress"});
+    # older ones ship a single flat dict shared by all layer types.
+    if isinstance(rope_parameters.get("main"), dict) and isinstance(
+        rope_parameters.get("compress"), dict
+    ):
+        key = "compress" if compress_ratio > 1 else "main"
+        rope_parameters = dict(rope_parameters[key])
+    else:
+        rope_parameters = dict(rope_parameters)
+
     rope_parameters["rope_theta"] = (
         config.compress_rope_theta if compress_ratio > 1 else config.rope_theta
     )
     if use_unscaled_rope:
-        # The MTP draft layer of DSpark-style checkpoints (compress_ratios
-        # entry 0) is trained with plain rope, not the yarn-scaled variant.
         rope_parameters["rope_type"] = "default"
-    if rope_parameters["rope_type"] != "default":
+    elif compress_ratio > 1 and rope_parameters["rope_type"] != "default":
+        # YaRN applies only to compressor (CSA/HCA) layers.
         rope_parameters["rope_type"] = (
             "deepseek_yarn"
             if rope_parameters.get("apply_yarn_scaling", True)
             else "deepseek_llama_scaling"
         )
+    else:
+        # Sliding-window layers use plain RoPE (theta=rope_theta, no YaRN).
+        rope_parameters["rope_type"] = "deepseek_yarn"
+        rope_parameters["factor"] = 1.0
+        rope_parameters["original_max_position_embeddings"] = max_position_embeddings
     rope_parameters["mscale"] = 0  # Disable mscale
     rope_parameters["mscale_all_dim"] = 0  # Disable mscale
     rope_parameters["is_deepseek_v4"] = True

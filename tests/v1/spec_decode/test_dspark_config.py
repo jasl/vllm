@@ -19,6 +19,7 @@ def test_dspark_standard_rejection_uses_probabilistic_draft_sampling(monkeypatch
     )
     target_model_config = SimpleNamespace(
         model="deepseek-ai/DeepSeek-V4-Flash",
+        hf_config=SimpleNamespace(model_type="deepseek_v4"),
         quantization=None,
         tokenizer="deepseek-ai/DeepSeek-V4-Flash",
         tokenizer_mode="deepseek_v4",
@@ -167,8 +168,7 @@ def test_dspark_sequential_sampling_writes_persistent_draft_logits(monkeypatch):
     )
 
     class FakeModel:
-
-        def compute_logits(self, hidden_states):
+        def compute_draft_logits(self, hidden_states):
             return torch.arange(
                 hidden_states.shape[0] * vocab_size,
                 dtype=torch.float32,
@@ -189,6 +189,7 @@ def test_dspark_sequential_sampling_writes_persistent_draft_logits(monkeypatch):
         seeds,
         pos,
         apply_temperature,
+        is_drafting=False,
         logits_cache=None,
         logits_cache_col=None,
         use_fp64=False,

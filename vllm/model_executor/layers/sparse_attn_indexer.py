@@ -12,7 +12,6 @@ from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.attention.pcp import maybe_gather_indexer_k
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -37,6 +36,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     sparse_indexer_max_logits_bytes,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -354,7 +354,7 @@ def sparse_attn_indexer(
     kv_cache: torch.Tensor,
     q_quant: torch.Tensor,
     q_scale: torch.Tensor | None,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -679,6 +679,7 @@ def sparse_attn_indexer(
         used_direct_topk = False
         if (
             not current_platform.is_xpu()
+            and decode_metadata.global_seq_lens is None
             and logits_bytes > sparse_indexer_max_logits_bytes()
         ):
             used_direct_topk = fp8_fp4_paged_mqa_topk_indices(
@@ -687,12 +688,6 @@ def sparse_attn_indexer(
                 weights[:num_padded_tokens],
                 seq_lens,
                 decode_metadata.block_table,
-                # Ours. This is fp8_fp4_paged_mqa_topk_indices, our direct-topk
-                # path, which upstream does not have -- git aligned its argument
-                # tail against upstream's tail for fp8_fp4_paged_mqa_logits
-                # below. Upstream's new `indices=` kwarg belongs to THAT call and
-                # is applied there; taking this side alone would have dropped it,
-                # silently, because the kwarg defaults to None.
                 logits_width,
                 topk_indices,
             )
@@ -723,12 +718,8 @@ def sparse_attn_indexer(
                     seq_lens,
                     decode_metadata.block_table,
                     decode_metadata.schedule_metadata,
-                    # ours: the narrowed width, not the model's full window
                     max_model_len=logits_width,
                     clean_logits=False,
-                    # upstream #47808 -- landed in the conflict against our
-                    # topk_indices call above, so it has to be re-applied here,
-                    # on the call it actually belongs to
                     indices=decode_metadata.indices,
                 )
             num_rows = logits.shape[0]
@@ -742,7 +733,7 @@ def sparse_attn_indexer(
             use_cooperative_topk = (
                 current_platform.is_cuda()
                 and topk_tokens in (512, 1024, 2048)
-                and num_rows <= 32
+                and num_rows <= 64
                 and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
                 and current_platform.has_device_capability(90)
                 and not current_platform.is_device_capability_family(120)
@@ -827,7 +818,7 @@ def sparse_attn_indexer_fake(
     kv_cache: torch.Tensor,
     q_quant: torch.Tensor,
     q_scale: torch.Tensor | None,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -882,6 +873,7 @@ class SparseAttnIndexer(CustomOp):
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
+        compress_ratio: int = 1,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -894,26 +886,65 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        self.compress_ratio = compress_ratio
         self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
-        parallel_config = get_current_vllm_config().parallel_config
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
+        self._parallel_config = parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
-        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self._cp_kv_cache_interleave_size: int | None = None
         if _sparse_indexer_requires_deep_gemm(use_fp4_cache) and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
             )
 
+        if vllm_config.kernel_config.enable_jit_warmup:
+            from vllm.v1.attention.ops.common import (
+                _PACK_SEQ_TRITON_KERNEL,
+                _UNPACK_SEQ_TRITON_KERNEL,
+            )
+
+            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
+            _PACK_SEQ_TRITON_KERNEL.register_warmup(
+                dtype=pack_dtype,
+                pad_value=0 if use_fp4_cache else -float("inf"),
+            )
+            _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
+
+            if self.dcp_world_size > 1 and current_platform.is_cuda() and has_cutedsl():
+                from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (  # noqa: E501
+                    _PACK_DCP_TOPK_CANDIDATES_KERNEL,
+                    _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL,
+                )
+
+                _PACK_DCP_TOPK_CANDIDATES_KERNEL.register_warmup()
+                _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL.register_warmup()
+
+    @property
+    def cp_kv_cache_interleave_size(self) -> int:
+        """With PD+DCP, the real value isn't known until block_size is finalized,
+        which happens after this layer is built. Safe to cache after the first access,
+        as long as the adjustment always runs before any forward pass
+        (it's set up in Worker.initialize_from_config, ahead of warmup/serving).
+        """
+        if self._cp_kv_cache_interleave_size is None:
+            value = self._parallel_config.cp_kv_cache_interleave_size
+            if isinstance(get_forward_context().attn_metadata, dict):
+                self._cp_kv_cache_interleave_size = value
+            return value
+        return self._cp_kv_cache_interleave_size
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
@@ -930,7 +961,7 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
@@ -967,7 +998,7 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_fp8: torch.Tensor,
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         return self.forward_cuda(hidden_states, q_fp8, k, weights)
@@ -976,7 +1007,7 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
@@ -1005,6 +1036,7 @@ class SparseAttnIndexer(CustomOp):
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
+                compress_ratio=self.compress_ratio,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "

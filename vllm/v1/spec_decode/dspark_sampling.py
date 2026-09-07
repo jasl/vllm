@@ -297,9 +297,7 @@ def sample_dspark_markov_block_fused(
     tokens = (
         tokens_out[:batch_size, :block_size]
         if tokens_out is not None
-        else torch.empty(
-            (batch_size, block_size), dtype=torch.int64, device=device
-        )
+        else torch.empty((batch_size, block_size), dtype=torch.int64, device=device)
     )
     if draft_probs_out is not None and (
         draft_probs_out.shape[0] < batch_size
@@ -320,11 +318,21 @@ def sample_dspark_markov_block_fused(
     )
     num_blocks = (vocab_size + block_v - 1) // block_v
     scratch = {
-        "block_max": torch.empty((batch_size, num_blocks), dtype=torch.float32, device=device),
-        "block_sumexp": torch.empty((batch_size, num_blocks), dtype=torch.float32, device=device),
-        "block_gval": torch.empty((batch_size, num_blocks), dtype=torch.float32, device=device),
-        "block_maxid": torch.empty((batch_size, num_blocks), dtype=torch.int32, device=device),
-        "block_gid": torch.empty((batch_size, num_blocks), dtype=torch.int32, device=device),
+        "block_max": torch.empty(
+            (batch_size, num_blocks), dtype=torch.float32, device=device
+        ),
+        "block_sumexp": torch.empty(
+            (batch_size, num_blocks), dtype=torch.float32, device=device
+        ),
+        "block_gval": torch.empty(
+            (batch_size, num_blocks), dtype=torch.float32, device=device
+        ),
+        "block_maxid": torch.empty(
+            (batch_size, num_blocks), dtype=torch.int32, device=device
+        ),
+        "block_gid": torch.empty(
+            (batch_size, num_blocks), dtype=torch.int32, device=device
+        ),
         "row_max": torch.empty((batch_size,), dtype=torch.float32, device=device),
         "row_invz": torch.empty((batch_size,), dtype=torch.float32, device=device),
     }

@@ -353,13 +353,20 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
             )
 
             swa_idx_full, swa_len_full = _get_prefill_swa_scratch(
-                num_tokens, self.window_size
+                num_tokens, self.window_size + self.max_image_tokens
             )
             _compute_swa_indices_and_lens_kernel[(num_tokens,)](
                 swa_idx_full,
                 swa_idx_full.stride(0),
                 swa_len_full,
                 self.window_size,
+                self.window_size + self.max_image_tokens,
+                swa_metadata.prefill_left_visible
+                if swa_metadata.prefill_left_visible is not None
+                else swa_len_full,
+                swa_metadata.prefill_right_visible
+                if swa_metadata.prefill_right_visible is not None
+                else swa_len_full,
                 swa_metadata.query_start_loc,
                 swa_metadata.seq_lens,
                 swa_metadata.token_to_req_indices,
@@ -368,6 +375,7 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
                 swa_metadata.block_table.stride(0),
                 swa_metadata.block_size,
                 token_offset=0,
+                HAS_IMAGE=swa_metadata.prefill_left_visible is not None,
                 TRITON_BLOCK_SIZE=1024,
             )
             swa_indices = swa_idx_full[num_decode_tokens:num_tokens]

@@ -35,7 +35,6 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -874,6 +873,12 @@ def invoke_fused_moe_triton_kernel(
             BLOCK_SIZE_K,
         )
         use_td = False
+
+    # Triton treats 0-D tensor arguments as scalar values, but the kernel
+    # loads tensor-wise activation scales through a pointer.
+    if A_scale is not None and A_scale.ndim == 0:
+        A_scale = A_scale.reshape(1)
+
     fused_moe_kernel[grid](
         A,
         B,

@@ -224,6 +224,4 @@ class DeepseekV4FP8Config(Fp8Config):
     def is_mxfp4_quant(self, prefix, layer):
         if not isinstance(layer, RoutedExperts) or self.expert_dtype != "fp4":
             return False
-        return self.moe_quant_algo != "NVFP4" or self._is_draft_module_prefix(
-            prefix
-        )
+        return self.moe_quant_algo != "NVFP4" or self._is_draft_module_prefix(prefix)
